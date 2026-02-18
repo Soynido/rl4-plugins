@@ -1,0 +1,13 @@
+# Dependencies (installed on plugin install)
+plugins/rl4/mcp-server/node_modules/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Test artifacts
+plugins/rl4/mcp-server/.rl4/
+
+# Source code — only dist is distributed
+plugins/rl4/mcp-server/src/
+plugins/rl4/mcp-server/tsconfig.json

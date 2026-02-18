@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "rl4": {
+      "command": "node",
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/dist/index.js"],
+      "env": {
+        "RL4_WORKSPACE_ROOT": ".",
+        "SUPABASE_URL": "https://obgwcqxvzefsnovxmtgm.supabase.co",
+        "SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iZ3djcXh2emVmc25vdnhtdGdtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwMzUxNjgsImV4cCI6MjA4NTYxMTE2OH0.zJtCp2sqrmWNOZCResyXlMDBcmtIZZq1ZUKQpObzdkI"
+      },
+      "disabled": false
+    }
+  }
+}

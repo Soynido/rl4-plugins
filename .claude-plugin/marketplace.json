@@ -1,0 +1,35 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "rl4-plugins",
+  "description": "RL4 — Cross-LLM memory for your codebase. Context that follows you across Cursor, VS Code, and Claude Code.",
+  "owner": {
+    "name": "RL4",
+    "email": "valentin@rl4.ai"
+  },
+  "plugins": [
+    {
+      "name": "rl4",
+      "source": "./plugins/rl4",
+      "description": "Cross-LLM development context — memory, evidence, and code RAG for your codebase. Seamless context transfer between Cursor, VS Code, and Claude Code CLI.",
+      "version": "2.0.2",
+      "author": {
+        "name": "RL4",
+        "email": "valentin@rl4.ai"
+      },
+      "category": "development",
+      "homepage": "https://rl4.ai",
+      "tags": ["mcp", "rag", "context", "cross-llm", "memory"],
+      "mcpServers": {
+        "rl4": {
+          "command": "node",
+          "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/dist/index.js"],
+          "env": {
+            "RL4_WORKSPACE_ROOT": ".",
+            "SUPABASE_URL": "https://obgwcqxvzefsnovxmtgm.supabase.co",
+            "SUPABASE_ANON_KEY": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Im9iZ3djcXh2emVmc25vdnhtdGdtIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzAwMzUxNjgsImV4cCI6MjA4NTYxMTE2OH0.zJtCp2sqrmWNOZCResyXlMDBcmtIZZq1ZUKQpObzdkI"
+          }
+        }
+      }
+    }
+  ]
+}
