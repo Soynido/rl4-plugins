@@ -1,7 +1,6 @@
 {
   "name": "rl4",
-  "displayName": "RL4 — Cross-LLM Memory",
-  "description": "Cross-LLM development context — memory, evidence, and code RAG for your codebase. Works seamlessly across Claude Code, Cursor, and VS Code.",
+  "description": "RL4 — Cross-LLM development context. Memory, evidence, and code RAG for your codebase. Works seamlessly across Claude Code, Cursor, and VS Code.",
   "version": "2.0.2",
   "author": {
     "name": "RL4",
