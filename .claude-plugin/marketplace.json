@@ -11,7 +11,7 @@
       "name": "rl4",
       "source": "./plugins/rl4",
       "description": "Cross-LLM development context — memory, evidence, and code RAG for your codebase. Seamless context transfer between Cursor, VS Code, and Claude Code CLI.",
-      "version": "2.0.2",
+      "version": "2.0.3",
       "author": {
         "name": "RL4",
         "email": "valentin@rl4.ai"
@@ -22,7 +22,7 @@
       "mcpServers": {
         "rl4": {
           "command": "node",
-          "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/dist/index.js"],
+          "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/launch.js"],
           "env": {
             "RL4_WORKSPACE_ROOT": ".",
             "SUPABASE_URL": "https://obgwcqxvzefsnovxmtgm.supabase.co",

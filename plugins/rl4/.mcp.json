@@ -2,7 +2,7 @@
   "mcpServers": {
     "rl4": {
       "command": "node",
-      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/dist/index.js"],
+      "args": ["${CLAUDE_PLUGIN_ROOT}/mcp-server/launch.js"],
       "env": {
         "RL4_WORKSPACE_ROOT": ".",
         "SUPABASE_URL": "https://obgwcqxvzefsnovxmtgm.supabase.co",
