@@ -153,8 +153,11 @@ export function chunkDecisions(decisions, filePath) {
         };
     });
 }
-/** chat_history.jsonl: chunks by thread (window of messages); metadata thread_id, first_ts, last_ts */
-export function chunkChat(messages, filePath, messagesPerChunk = 20) {
+/** Max bytes per chat chunk — ensures no single chunk blows up the MCP response */
+const CHAT_CHUNK_BYTE_BUDGET = 4000;
+/** chat_history.jsonl: chunks by thread (window of messages); metadata thread_id, first_ts, last_ts.
+ *  Uses a byte-budget accumulator: flushes when adding another message would exceed CHAT_CHUNK_BYTE_BUDGET. */
+export function chunkChat(messages, filePath, messagesPerChunk = 8) {
     var _a, _b, _c;
     const chunks = [];
     const byThread = new Map();
@@ -165,16 +168,19 @@ export function chunkChat(messages, filePath, messagesPerChunk = 20) {
         byThread.get(tid).push(m);
     }
     for (const [thread_id, msgs] of byThread) {
-        for (let i = 0; i < msgs.length; i += messagesPerChunk) {
-            const window = msgs.slice(i, i + messagesPerChunk);
-            const first = window[0];
-            const last = window[window.length - 1];
-            const first_ts = (_b = first === null || first === void 0 ? void 0 : first.timestamp) !== null && _b !== void 0 ? _b : "";
-            const last_ts = (_c = last === null || last === void 0 ? void 0 : last.timestamp) !== null && _c !== void 0 ? _c : "";
-            const content = window
-                .map((m) => { var _a, _b; return `[${(_a = m.role) !== null && _a !== void 0 ? _a : "?"}] ${((_b = m.text) !== null && _b !== void 0 ? _b : "").slice(0, 2000)}`; })
-                .join("\n");
-            const range = `${thread_id}:${i}-${i + window.length}`;
+        let windowStart = 0;
+        let windowLines = [];
+        let windowBytes = 0;
+        const flush = (endIdx) => {
+            var _a, _b;
+            if (windowLines.length === 0)
+                return;
+            const content = windowLines.join("\n");
+            const first = msgs[windowStart];
+            const last = msgs[endIdx - 1];
+            const first_ts = (_a = first === null || first === void 0 ? void 0 : first.timestamp) !== null && _a !== void 0 ? _a : "";
+            const last_ts = (_b = last === null || last === void 0 ? void 0 : last.timestamp) !== null && _b !== void 0 ? _b : "";
+            const range = `${thread_id}:${windowStart}-${endIdx}`;
             const id = stableId(content, "chat", range);
             chunks.push({
                 id,
@@ -193,7 +199,22 @@ export function chunkChat(messages, filePath, messagesPerChunk = 20) {
                     thread_id,
                 },
             });
+            windowLines = [];
+            windowBytes = 0;
+            windowStart = endIdx;
+        };
+        for (let i = 0; i < msgs.length; i++) {
+            const m = msgs[i];
+            const line = `[${(_b = m.role) !== null && _b !== void 0 ? _b : "?"}] ${((_c = m.text) !== null && _c !== void 0 ? _c : "").slice(0, 800)}`;
+            const lineBytes = line.length;
+            // Flush if adding this message would exceed budget or message count
+            if (windowLines.length > 0 && (windowBytes + lineBytes > CHAT_CHUNK_BYTE_BUDGET || windowLines.length >= messagesPerChunk)) {
+                flush(i);
+            }
+            windowLines.push(line);
+            windowBytes += lineBytes;
         }
+        flush(msgs.length);
     }
     return chunks;
 }

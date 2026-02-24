@@ -1,0 +1,17 @@
+{
+  "description": "RL4 file activity tracking — captures Edit/Write events into .rl4/evidence/activity.jsonl for cross-LLM context parity with IDE",
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/rl4-track.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ]
+  }
+}
