@@ -1,3 +1,7 @@
+---
+description: Render project dashboard with ASCII stats when user asks for project status
+---
+
 # RL4 Dashboard — ASCII Stats Display
 
 ## When to activate

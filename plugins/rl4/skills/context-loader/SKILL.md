@@ -1,3 +1,7 @@
+---
+description: Auto-load project context when user asks about history, decisions, or past work
+---
+
 # RL4 Context Loader
 
 ## When to activate

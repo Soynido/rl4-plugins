@@ -1,24 +1,309 @@
 /**
- * search_context: RAG pipeline — pre-filter → BM25 → RRF → rerank → top K.
+ * search_context: Live JSONL queries — no BM25 index, no RAG.
+ * Reads evidence JSONL files directly, scores by query term overlap, returns top K.
  * Returns Perplexity-style structured output: synthesis instruction + smart snippets + relevance + confidence.
  */
-import { runRAG } from "./rag.js";
+import * as fs from "fs";
+import * as path from "path";
+import { readIntentGraphData, readCausalLinks } from "./workspace.js";
+import { getIngestBuffer } from "./ingest_buffer.js";
 /** Max chars per individual source snippet */
 const MAX_SNIPPET_CHARS = 1200;
 /** Max total chars for the entire MCP response */
 const MAX_TOTAL_CHARS = 15000;
+/**
+ * File-stat cache: avoids full re-reads when the file hasn't changed.
+ * ~6 evidence files cached, total <2MB. Invalidates instantly on mtime change.
+ * statSync is ~0.1ms vs full read at ~5-50ms.
+ */
+const fileCache = new Map();
+function readJsonlLines(filePath) {
+    const diskLines = [];
+    if (fs.existsSync(filePath)) {
+        try {
+            const stat = fs.statSync(filePath);
+            const cached = fileCache.get(filePath);
+            if (cached && cached.mtimeMs === stat.mtimeMs) {
+                diskLines.push(...cached.lines);
+            }
+            else {
+                const lines = fs.readFileSync(filePath, "utf8")
+                    .split("\n")
+                    .filter(l => l.trim() && l.trim().startsWith("{"));
+                fileCache.set(filePath, { mtimeMs: stat.mtimeMs, lines });
+                diskLines.push(...lines);
+            }
+        }
+        catch { /* skip */ }
+    }
+    // Merge in-memory ingest buffer (Single-Writer: events not yet in mtime cache)
+    const basename = path.basename(filePath);
+    try {
+        const buffer = getIngestBuffer();
+        const pending = buffer.get(basename);
+        if (pending && pending.length > 0) {
+            // Deduplicate: only add lines not already in disk cache
+            const diskSet = new Set(diskLines);
+            for (const line of pending) {
+                if (!diskSet.has(line)) {
+                    diskLines.push(line);
+                }
+            }
+        }
+    }
+    catch { /* getIngestBuffer may not be available during init */ }
+    return diskLines;
+}
+function loadChatEntries(root) {
+    const lines = readJsonlLines(path.join(root, ".rl4", "evidence", "chat_history.jsonl"));
+    const entries = [];
+    for (const line of lines) {
+        try {
+            const obj = JSON.parse(line);
+            // Backward-compatible: support both old format (textDescription/unixMs) and new (content/unix_ms)
+            const content = obj.content || obj.textDescription || '';
+            if (!content || typeof content !== 'string')
+                continue;
+            const unix_ms = obj.unix_ms || obj.unixMs;
+            const timestamp = obj.timestamp || (unix_ms ? new Date(unix_ms).toISOString() : undefined);
+            const thread_id = obj.thread_id || obj.transcript_ref || 'unknown';
+            entries.push({
+                content,
+                source: "chat",
+                citation: `chat:${thread_id}`,
+                date: timestamp ? timestamp.slice(0, 10) : undefined,
+                unix_ms,
+            });
+        }
+        catch { /* skip */ }
+    }
+    return entries;
+}
+function loadActivityEntries(root) {
+    const lines = readJsonlLines(path.join(root, ".rl4", "evidence", "activity.jsonl"));
+    // Lazy-load intent graph + causal links (cached by mtime)
+    const ig = readIntentGraphData(root);
+    const chainMap = new Map();
+    if (ig && Array.isArray(ig.chains)) {
+        for (const c of ig.chains)
+            chainMap.set(c.file, c);
+    }
+    const causalLinks = readCausalLinks(root);
+    // Index causal links by file for O(1) lookup
+    const causalByFile = new Map();
+    for (const cl of causalLinks) {
+        if (cl.file)
+            causalByFile.set(cl.file, { chat_ref: cl.chat_ref });
+    }
+    const entries = [];
+    for (const line of lines) {
+        try {
+            const obj = JSON.parse(line);
+            if (!obj.path)
+                continue;
+            let desc = `${obj.kind || "save"}: ${obj.path}` +
+                (obj.linesAdded ? ` (+${obj.linesAdded}/-${obj.linesRemoved || 0})` : "");
+            // Enrich with causal link (prompt → file save)
+            const causal = causalByFile.get(obj.path);
+            if (causal) {
+                desc += ` | Caused by prompt: ${causal.chat_ref}`;
+            }
+            // Enrich with intent graph data (reversals + hunks)
+            const chain = chainMap.get(obj.path);
+            if (chain) {
+                if (chain.hot_score > 0.3) {
+                    desc += ` | 🔥 hot_score=${chain.hot_score.toFixed(2)} trajectory=${chain.trajectory}`;
+                }
+                if (chain.last_reversal) {
+                    const lr = chain.last_reversal;
+                    desc += ` | ⚠️ REVERSAL: v${lr.from_v}→v${lr.to_v} reverted ${lr.reverted_lines} lines`;
+                    if (lr.hunks && lr.hunks.length > 0) {
+                        const hunkSummary = lr.hunks.slice(0, 3).map(h => `L${h.startOld}${h.countOld > 1 ? `-${h.startOld + h.countOld - 1}` : ""}`).join(", ");
+                        desc += ` at [${hunkSummary}]`;
+                    }
+                }
+            }
+            entries.push({
+                content: desc,
+                source: "evidence",
+                citation: `activity:${obj.path}`,
+                date: obj.t ? obj.t.slice(0, 10) : undefined,
+                unix_ms: obj.t ? new Date(obj.t).getTime() : undefined,
+            });
+        }
+        catch { /* skip */ }
+    }
+    return entries;
+}
+function loadThreadEntries(root) {
+    const lines = readJsonlLines(path.join(root, ".rl4", "evidence", "chat_threads.jsonl"));
+    const entries = [];
+    for (const line of lines) {
+        try {
+            const obj = JSON.parse(line);
+            const text = [obj.title, ...(obj.topics || [])].filter(Boolean).join(" | ");
+            if (!text)
+                continue;
+            entries.push({
+                content: `Thread: ${text} (${obj.count || 0} msgs, ${obj.provider || "unknown"})`,
+                source: "chat",
+                citation: `thread:${obj.thread_key || "unknown"}`,
+                date: obj.last_ts ? obj.last_ts.slice(0, 10) : undefined,
+                unix_ms: obj.lastMs,
+            });
+        }
+        catch { /* skip */ }
+    }
+    return entries;
+}
+function loadDecisionEntries(root) {
+    const lines = readJsonlLines(path.join(root, ".rl4", "evidence", "decisions.jsonl"));
+    const entries = [];
+    for (const line of lines) {
+        try {
+            const obj = JSON.parse(line);
+            const text = [obj.intent_text, obj.chosen_option, obj.reasoning].filter(Boolean).join(" — ");
+            if (!text)
+                continue;
+            entries.push({
+                content: `Decision: ${text}`,
+                source: "decisions",
+                citation: `decision:${obj.id || "unknown"}`,
+                date: obj.isoTimestamp ? obj.isoTimestamp.slice(0, 10) : undefined,
+                unix_ms: obj.isoTimestamp ? new Date(obj.isoTimestamp).getTime() : undefined,
+            });
+        }
+        catch { /* skip */ }
+    }
+    return entries;
+}
+function loadTimelineEntries(root) {
+    const tlPath = path.join(root, ".rl4", "timeline.md");
+    if (!fs.existsSync(tlPath))
+        return [];
+    try {
+        const content = fs.readFileSync(tlPath, "utf8");
+        // Split by ## headings — each section is an entry
+        const sections = content.split(/^## /m).filter(s => s.trim().length > 20);
+        return sections.map(s => {
+            const firstLine = s.split("\n")[0] || "";
+            // Try to extract date from heading like "2026-02-22 ..."
+            const dateMatch = firstLine.match(/(\d{4}-\d{2}-\d{2})/);
+            return {
+                content: s.slice(0, 1500),
+                source: "timeline",
+                citation: `timeline:${firstLine.slice(0, 80)}`,
+                date: dateMatch === null || dateMatch === void 0 ? void 0 : dateMatch[1],
+            };
+        });
+    }
+    catch {
+        return [];
+    }
+}
+function loadCliEntries(root) {
+    const lines = readJsonlLines(path.join(root, ".rl4", "evidence", "cli_history.jsonl"));
+    const entries = [];
+    for (const line of lines) {
+        try {
+            const obj = JSON.parse(line);
+            const text = obj.command || obj.content || obj.prompt || "";
+            if (!text)
+                continue;
+            entries.push({
+                content: text,
+                source: "cli",
+                citation: `cli:${text.slice(0, 60)}`,
+                date: (obj.timestamp || obj.t) ? (obj.timestamp || obj.t).slice(0, 10) : undefined,
+                unix_ms: obj.unix_ms || (obj.timestamp ? new Date(obj.timestamp).getTime() : undefined),
+            });
+        }
+        catch { /* skip */ }
+    }
+    return entries;
+}
+// ── Scoring ──────────────────────────────────────────────────────────────────
+function scoreEntry(entry, queryTerms) {
+    const lower = entry.content.toLowerCase();
+    let score = 0;
+    for (const term of queryTerms) {
+        if (lower.includes(term))
+            score += 1;
+        // Bonus for exact word match (not just substring)
+        const wordRegex = new RegExp(`\\b${term.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+        if (wordRegex.test(entry.content))
+            score += 0.5;
+    }
+    // Recency bonus: entries from last 24h get +0.5, last week +0.25
+    if (entry.unix_ms) {
+        const ageMs = Date.now() - entry.unix_ms;
+        if (ageMs < 86400000)
+            score += 0.5;
+        else if (ageMs < 604800000)
+            score += 0.25;
+    }
+    return score;
+}
+// ── Main function ────────────────────────────────────────────────────────────
 export function searchContext(root, query, filters = {}) {
-    const ragFilters = {
-        source: filters.source,
-        date_from: filters.date_from,
-        date_to: filters.date_to,
-        tag: filters.tag,
-        file: filters.file,
-        limit: filters.limit,
-    };
-    const result = runRAG(root, query, ragFilters);
-    const chunks = result.chunks.map((c) => toSearchChunk(c, query));
-    return { chunks, confidence: result.confidence };
+    var _a;
+    const limit = (_a = filters.limit) !== null && _a !== void 0 ? _a : 5;
+    const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length >= 2);
+    if (queryTerms.length === 0) {
+        return { chunks: [], confidence: 0 };
+    }
+    // Load entries from relevant sources
+    let allEntries = [];
+    const src = filters.source;
+    if (!src || src === "chat")
+        allEntries.push(...loadChatEntries(root), ...loadThreadEntries(root));
+    if (!src || src === "evidence")
+        allEntries.push(...loadActivityEntries(root));
+    if (!src || src === "timeline")
+        allEntries.push(...loadTimelineEntries(root));
+    if (!src || src === "decisions")
+        allEntries.push(...loadDecisionEntries(root));
+    if (!src || src === "cli")
+        allEntries.push(...loadCliEntries(root));
+    // Apply date filters
+    if (filters.date_from) {
+        const fromMs = new Date(filters.date_from + "T00:00:00Z").getTime();
+        allEntries = allEntries.filter(e => !e.unix_ms || e.unix_ms >= fromMs);
+    }
+    if (filters.date_to) {
+        const toMs = new Date(filters.date_to + "T23:59:59Z").getTime();
+        allEntries = allEntries.filter(e => !e.unix_ms || e.unix_ms <= toMs);
+    }
+    // Apply file filter
+    if (filters.file) {
+        const filePattern = filters.file.toLowerCase();
+        allEntries = allEntries.filter(e => e.citation.toLowerCase().includes(filePattern) ||
+            e.content.toLowerCase().includes(filePattern));
+    }
+    // Score and rank
+    const scored = allEntries.map(e => ({ entry: e, score: scoreEntry(e, queryTerms) }));
+    scored.sort((a, b) => b.score - a.score);
+    // Filter out zero-score entries
+    const relevant = scored.filter(s => s.score > 0);
+    // Take top K
+    const topK = relevant.slice(0, limit);
+    // Convert to SearchChunk
+    const maxScore = topK.length > 0 ? topK[0].score : 1;
+    const chunks = topK.map(({ entry, score }) => {
+        const normalized = maxScore > 0 ? score / maxScore : 0;
+        const snippet = extractSnippet(entry.content, query, MAX_SNIPPET_CHARS);
+        return {
+            source: entry.citation,
+            date: entry.date,
+            excerpt: snippet,
+            relevance: normalized >= 0.7 ? "high" : normalized >= 0.35 ? "medium" : "low",
+        };
+    });
+    // Confidence based on how many terms matched in the best result
+    const confidence = topK.length > 0
+        ? Math.min(1, topK[0].score / Math.max(queryTerms.length, 1))
+        : 0;
+    return { chunks, confidence };
 }
 // ── Smart snippet extraction ─────────────────────────────────────────────────
 /** Score a sentence by query term overlap */
@@ -88,33 +373,11 @@ function extractSnippet(content, query, maxChars) {
     }
     return parts.join("\n");
 }
-// ── Relevance level ──────────────────────────────────────────────────────────
-function relevanceLevel(score) {
-    if (score >= 0.7)
-        return "high";
-    if (score >= 0.35)
-        return "medium";
-    return "low";
-}
 const RELEVANCE_INDICATOR = {
     high: "●●●",
     medium: "●●○",
     low: "●○○",
 };
-// ── Chunk formatting ─────────────────────────────────────────────────────────
-function toSearchChunk(c, query) {
-    const cite = c.citation;
-    const snippet = extractSnippet(c.content, query, MAX_SNIPPET_CHARS);
-    const excerpt = `[${cite.file} ${cite.line_or_range}${cite.date ? ` | ${cite.date}` : ""}]\n${snippet}`;
-    return {
-        source: cite.file,
-        line_start: c.metadata.line_start,
-        line_end: c.metadata.line_end,
-        date: cite.date,
-        excerpt,
-        relevance: relevanceLevel(c.relevanceScore),
-    };
-}
 // ── Confidence label ─────────────────────────────────────────────────────────
 function confidenceLabel(confidence) {
     if (confidence >= 0.7)

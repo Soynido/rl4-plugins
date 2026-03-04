@@ -23,112 +23,134 @@ Every time you switch editors, start a new chat, or come back to a project after
 - No more lost decisions and forgotten context
 - No more "I don't have access to previous conversations"
 
-## Install
+## Install (Step by Step)
 
-In Claude Code CLI:
+### 1. Add the RL4 marketplace
 
-```bash
-claude plugin marketplace add Soynido/rl4-plugins
-claude plugin install rl4
-```
-
-Or from within a Claude Code session:
+In Claude Code, run:
 
 ```
 /plugin marketplace add Soynido/rl4-plugins
-/plugin install rl4
 ```
 
-## Get Started
+This registers the RL4 marketplace. You only need to do this once.
 
-### 1. Authenticate
+### 2. Install the RL4 plugin
 
-**Option A — You already use Cursor or VS Code with RL4:**
+```
+/plugin install rl4@rl4-plugins
+```
 
-Credentials sync automatically via `~/.rl4/mcp.env`. Just make sure you've run `RL4: Connect` (Cmd+Shift+P) in your IDE. No extra setup needed.
+This installs the plugin with all commands, skills, and the MCP server.
 
-**Option B — Claude Code standalone (no IDE):**
-
-Go to [rl4.ai/dashboard/setup](https://rl4.ai/dashboard/setup), sign in, and follow the Claude Code instructions to configure your credentials.
-
-### 2. Activate
+### 3. Activate RL4
 
 ```
 /rl4
 ```
 
-That's it. RL4 shows you an ASCII dashboard with your project stats and gives you full access to your development memory.
+That's it. RL4 shows you a dashboard with your project stats and gives you full access to your development memory.
 
-## What You Get
+> **Tip**: If commands don't appear after install, try: `rm -rf ~/.claude/plugins/cache` then restart Claude Code and reinstall.
 
-### Persistent Memory
-Every chat, decision, file change, and commit — captured automatically and queryable instantly. Ask "What was I working on last week?" and get a cited answer.
+## Commands
 
-### Cross-LLM Context Transfer
-Switch from Cursor to Claude Code CLI to VS Code — your context follows. Zero re-setup. The same memory layer works everywhere.
-
-### Proof-Based Answers
-Every answer is backed by evidence. No hallucinations, no guesses — just facts from your actual development history, with sources cited.
-
-### Smart Search (RAG)
-Search across your entire development history with natural language. "What decisions did we make about auth?" returns relevant results with citations.
-
-### Project Skills & Guardrails
-Auto-generated DO/DON'T rules extracted from your real development activity. Your AI learns from your project's history, not generic patterns.
-
-## Available Commands
+RL4 gives you **12 commands** that chain 24 MCP tools automatically — you never need to call raw tools. Plus, an intelligent auto-recommend system suggests the right command based on your prompt.
 
 | Command | What it does |
 |---------|-------------|
-| `/rl4` | Activate RL4 with ASCII dashboard |
-| `rl4_ask("question")` | Get cited answers about your codebase |
-| `search_context("query")` | Search all evidence with RAG |
-| `get_evidence` | Full evidence pack |
-| `get_timeline` | Project history journal |
-| `get_decisions` | Decision log with confidence |
-| `search_chats("query")` | Search chat history |
-| `search_cli("query")` | Search CLI command history |
+| `/rl4` | Activate RL4 — dashboard with project stats and onboarding |
+| `/rl4:ask` | Ask anything about your project — cited answers from all editors |
+| `/rl4:plan` | Plan any task with full project context (decisions, AVOID patterns, coupling) |
+| `/rl4:resume` | Pick up where you left off — last session, hot files, next steps |
+| `/rl4:commit` | Context-aware git commit — audits changes, generates enriched message, indexes into evidence |
+| `/rl4:refactor` | Safe refactoring — pre-edit briefing from past mistakes, post-edit audit |
+| `/rl4:debug` | Debug with history — find similar bugs that were already solved |
+| `/rl4:feature` | Build a feature informed by project patterns and past decisions |
+| `/rl4:review` | Review changes against project history — catch repeated mistakes |
+| `/rl4:sync` | Sync chat history from Cursor, VS Code, and Claude Code into RL4 evidence |
+| `/rl4:snapshot` | Capture full project state — evidence, timeline, skills, git history |
+| `/rl4:onboard` | Generate a project briefing for new team members from real history |
 
-## Works With
+### Quick examples
 
-| Editor | Status |
-|--------|--------|
-| **Cursor** | Full support via [RL4 Extension](https://marketplace.visualstudio.com/items?itemName=rl4.rl4-snapshot-cursor) |
-| **VS Code** | Full support via RL4 Extension |
-| **Claude Code CLI** | Full support via this plugin |
-| **Codex / Gemini** | MCP compatible |
+```
+/rl4:ask what did we work on yesterday?
+/rl4:plan migrate the auth system to OAuth2
+/rl4:commit auth refactor
+/rl4:refactor src/app.ts split into modules
+/rl4:debug ERR_MODULE_NOT_FOUND when starting the server
+/rl4:sync
+/rl4:resume
+```
+
+## How It Works
+
+### 1. Your AI writes to `.rl4/`
+Every editor (Cursor, VS Code, Claude Code) writes development activity to a shared `.rl4/` directory in your project root — chat history, file events, decisions, timeline.
+
+### 2. MCP tools read from `.rl4/`
+The RL4 MCP server exposes 24 tools that search, analyze, and cross-reference your development history. The 10 commands above chain these tools automatically.
+
+### 3. Cross-LLM memory
+Switch from Cursor to Claude Code to VS Code — your context follows. The `.rl4/` directory is the shared memory layer. No sync needed.
+
+| Editor | Writes to .rl4/ | Reads from .rl4/ |
+|--------|-----------------|-------------------|
+| Cursor | snapshots, evidence, chat | MCP tools |
+| VS Code | snapshots, evidence, chat | MCP tools |
+| Claude Code | timeline, decisions, activity | MCP tools + commands |
+
+## Authentication
+
+**Option A — You already use Cursor or VS Code with RL4:**
+
+Credentials sync automatically via `~/.rl4/mcp.env`. Run `RL4: Connect` (Cmd+Shift+P) in your IDE. No extra setup needed.
+
+**Option B — Claude Code standalone:**
+
+Go to [rl4.ai/start](https://rl4.ai/start), sign in with GitHub, and follow the Claude Code instructions.
+
+**Option C — Local only (no auth):**
+
+RL4 works locally without authentication. Your `.rl4/` directory is always readable. Cloud features (team sharing, remote workspaces) require auth.
+
+## Team Features
+
+RL4 supports team context sharing:
+
+- **Auto-discovery**: Teammates on the same repo are found automatically
+- **Shared workspaces**: Browse a colleague's context (read-only) via `set_workspace`
+- **Team onboarding**: `/rl4:onboard` generates a project briefing from real development history
 
 ## Requirements
 
 - Node.js >= 18
 - Claude Code (latest version)
-- RL4 account — [rl4.ai/dashboard/setup](https://rl4.ai/dashboard/setup)
 
 ## Troubleshooting
 
-### Plugin install fails
+### MCP server won't start
 
-Make sure you've added the marketplace first:
+Re-install dependencies:
 ```bash
-claude plugin marketplace add Soynido/rl4-plugins
+cd ~/.claude/plugins/cache/rl4/mcp-server && npm install
 ```
 
-### MCP server won't start (ERR_MODULE_NOT_FOUND)
-
-The plugin runs `setup.sh` during install to install npm dependencies. If deps are missing, re-run:
-```bash
-cd ~/.claude/plugins/installed/rl4/mcp-server && npm install
-```
-
-### Token expired (401 errors)
+### Token expired (401)
 
 If you use Cursor/VS Code: run `RL4: Connect` (Cmd+Shift+P) then reload.
 
-The MCP server reads credentials from `~/.rl4/mcp.env` (auto-generated by the IDE extension). Tokens refresh on each `RL4: Connect`.
+### No evidence found
 
-### Local-only mode
+Run `/rl4:snapshot` to capture your project state. If you already use RL4 in Cursor/VS Code, the evidence is already there.
 
-RL4 works locally without authentication. Your `.rl4/` directory is always readable. Cloud features (list_workspaces, remote context) require auth.
+### Commands not showing up
+
+```bash
+rm -rf ~/.claude/plugins/cache
+```
+Then restart Claude Code and reinstall with `/plugin install rl4@rl4-plugins`.
 
 ## Beta Access
 

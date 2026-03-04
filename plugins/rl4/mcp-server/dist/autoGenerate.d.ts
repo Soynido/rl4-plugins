@@ -6,7 +6,7 @@
  *   - sessions.jsonl   (bursts: files, pattern, duration)
  *   - activity.jsonl    (file saves: path, sha256, linesAdded/Removed)
  *   - chat_threads.jsonl (thread summaries: title, count, timestamps)
- *   - chat_history.jsonl (message count only — not read line by line)
+ *   - chat_history.jsonl (message count + thread synthesis for orphan messages)
  *   - file_index.json   (content store: file → checksum)
  */
 export declare function rebuildTimeline(root: string): string;

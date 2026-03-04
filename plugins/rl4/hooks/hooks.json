@@ -1,5 +1,5 @@
 {
-  "description": "RL4 file activity tracking — captures Edit/Write events into .rl4/evidence/activity.jsonl for cross-LLM context parity with IDE",
+  "description": "RL4 hooks — file tracking, auto-recommendations",
   "hooks": {
     "PostToolUse": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "\"${CLAUDE_PLUGIN_ROOT}/hooks/rl4-track.sh\"",
+            "timeout": 5
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "prompt",
+            "prompt": "You are an RL4 command recommender for Claude Code. Based on the user's prompt, suggest the most relevant /rl4:* command IF one clearly matches. Available commands: /rl4:ask (questions about project history or past decisions), /rl4:commit (create an enriched git commit with audit), /rl4:debug (debug an issue with full context), /rl4:feature (build a new feature with safety checks), /rl4:plan (plan a task before coding), /rl4:refactor (refactor code with audit), /rl4:review (review code or a PR), /rl4:sync (sync chat history from all editors), /rl4:snapshot (full project evidence capture), /rl4:resume (resume from where you left off), /rl4:onboard (project briefing for new devs). If the user's prompt clearly matches one command, respond with {\"ok\": true} and include a one-line suggestion like: 'Tip: try /rl4:commit for context-aware commits'. If no command clearly matches (general coding, simple questions, etc.), respond with {\"ok\": true} and no output. NEVER block the prompt. Only suggest when confidence is high.",
             "timeout": 5
           }
         ]

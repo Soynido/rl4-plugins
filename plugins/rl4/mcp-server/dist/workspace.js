@@ -6,6 +6,7 @@
 import * as fs from "fs";
 import * as path from "path";
 import { resolveUnderRoot } from "./safePath.js";
+import { lockedAppend, lockedWrite } from "./utils/fs_lock.js";
 import { stableLessonId } from "./causal_engine.js";
 export function getWorkspaceRoot() {
     var _a;
@@ -313,27 +314,42 @@ export function loadLessonsForFile(root, relPath) {
         }
         catch { /* non-critical */ }
     }
-    // 2. Skills.mdc AVOID patterns — match AVOID, NEVER, NE JAMAIS, DONT, DO NOT
+    // 2a. Dynamic AVOID patterns from file history (primary source)
+    try {
+        const history = reconstructFileHistory(root, relPath);
+        for (const warning of history.dynamic_warnings) {
+            lessons.avoid_patterns.push(warning);
+        }
+    }
+    catch { /* non-critical — fall through to skills.mdc fallback */ }
+    // 2b. Skills.mdc AVOID patterns — FALLBACK only (cap 3, filtered)
     const skillsContent = readFileSafe(resolveUnderRoot(root, ".rl4", "skills.mdc"));
     if (skillsContent) {
         const lines = skillsContent.split('\n');
         let inAvoidSection = false;
+        let genericCount = 0;
         for (const line of lines) {
             const trimmed = line.trim();
-            // Detect section headers
             if (/^##?\s/.test(trimmed)) {
                 inAvoidSection = /AVOID|NEVER|NE JAMAIS|DONT|DO NOT|REFAIRE/i.test(trimmed);
                 continue;
             }
-            // Capture lines in AVOID sections that are bullet points
             if (inAvoidSection && /^[-*]\s/.test(trimmed)) {
-                // Include if: mentions this file OR is a generic rule (no file-specific filter)
-                if (trimmed.includes(fileName) || trimmed.includes(relPath)) {
-                    lessons.avoid_patterns.push(trimmed.replace(/^[-*]\s*/, ''));
+                const text = trimmed.replace(/^[-*]\s*/, '');
+                // Skip garbage: session summaries, system prompts (auto-mined junk)
+                if (/résumé|session is being continued|memory assistant|auto-mined/i.test(text))
+                    continue;
+                // File-specific: word-boundary match for fileName, exact match for relPath
+                const fileNameRegex = new RegExp(`\\b${fileName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`);
+                if (fileNameRegex.test(text) || text.includes(relPath)) {
+                    lessons.avoid_patterns.push(text);
                 }
-                else if (lessons.avoid_patterns.length < 10) {
-                    // Include generic AVOID patterns (up to 10, as context)
-                    lessons.avoid_patterns.push(trimmed.replace(/^[-*]\s*/, ''));
+                else if (genericCount < 3) {
+                    // Generic fallback: cap 3, skip overly long patterns (> 250 chars = likely garbage)
+                    if (text.length > 250)
+                        continue;
+                    lessons.avoid_patterns.push(text);
+                    genericCount++;
                 }
             }
         }
@@ -373,15 +389,398 @@ export function loadLessonsForFile(root, relPath) {
     catch { /* non-critical */ }
     return lessons;
 }
+// ── Dynamic File History Engine ─────────────────────────────────────────────
+// Reconstructs the REAL history of a file from ContentStore blobs, intent chains,
+// activity log, and chat threads. Generates dynamic warnings from mechanical facts
+// (reversals, hot_score, trajectory) — replaces static skills.mdc AVOID patterns.
+import * as zlib from "zlib";
+/**
+ * Universal Risk Model — 5-layer Laplace-smoothed risk scoring.
+ * Pure function, O(n), synchronous, ~2ms on typical input (~200 events).
+ * Based on Code Thrashing research (Nagappan & Ball 2005) + Lehman's Law.
+ */
+export function computeFileRisk(events, transitions) {
+    let totalScore = 0;
+    const episodes = [];
+    events.sort((a, b) => a.t - b.t);
+    transitions.sort((a, b) => a.t - b.t);
+    if (events.length === 0)
+        return { score: 0, episodes: [], lifetime_eff: 1 };
+    let totalAdded = 0;
+    let totalRemoved = 0;
+    // --- L1: Per-save anomalies ---
+    for (let i = 0; i < events.length; i++) {
+        const ev = events[i];
+        totalAdded += ev.linesAdded;
+        totalRemoved += ev.linesRemoved;
+        // REWRITE_IN_PLACE
+        if (ev.linesAdded > 20 && ev.linesRemoved > 20) {
+            const s = 8;
+            totalScore += s;
+            episodes.push({ signal: 'REWRITE_IN_PLACE', t: new Date(ev.t).toISOString(), score: s, detail: `Heavy rewrite: +${ev.linesAdded}/-${ev.linesRemoved} in single save` });
+        }
+        // LARGE_DELETE
+        if (ev.linesRemoved > 50 && ev.linesRemoved > (ev.linesAdded * 3)) {
+            const s = 10;
+            totalScore += s;
+            episodes.push({ signal: 'LARGE_DELETE', t: new Date(ev.t).toISOString(), score: s, detail: `Massive deletion: -${ev.linesRemoved} lines` });
+        }
+        // RAPID_EDIT
+        if (i > 0) {
+            const prev = events[i - 1];
+            if ((ev.t - prev.t) < 60000 && (ev.linesAdded + ev.linesRemoved > 5) && (prev.linesAdded + prev.linesRemoved > 5)) {
+                const s = 5;
+                totalScore += s;
+                episodes.push({ signal: 'RAPID_EDIT', t: new Date(ev.t).toISOString(), score: s, detail: `Panic edit: 2 substantial saves in <60s` });
+            }
+        }
+    }
+    // --- L2: Multi-scale window churn (Code Thrashing) ---
+    const windows = [
+        { name: 'CHURN_5min', ms: 5 * 60 * 1000, divisor: 10 },
+        { name: 'CHURN_30min', ms: 30 * 60 * 1000, divisor: 50 },
+        { name: 'CHURN_2h', ms: 120 * 60 * 1000, divisor: 200 },
+    ];
+    for (const win of windows) {
+        // Sliding window with trailing pointer to avoid O(n^2)
+        let left = 0;
+        for (let right = 0; right < events.length; right++) {
+            while (left < right && (events[right].t - events[left].t) > win.ms)
+                left++;
+            const winEvents = events.slice(left, right + 1);
+            if (winEvents.length >= 3) {
+                const wAdded = winEvents.reduce((sum, e) => sum + e.linesAdded, 0);
+                const wRemoved = winEvents.reduce((sum, e) => sum + e.linesRemoved, 0);
+                const wChurn = wAdded + wRemoved;
+                if (wChurn > win.divisor) { // Threshold: ignore trivial edits
+                    const wNet = Math.abs(wAdded - wRemoved);
+                    const efficiency = wNet / (wChurn + 10); // Laplace smoothing ε=10
+                    if (efficiency < 0.3) {
+                        const s = Math.round((wChurn / win.divisor) * (1 - efficiency));
+                        totalScore += s;
+                        episodes.push({ signal: win.name, t: new Date(events[right].t).toISOString(), score: s, detail: `${winEvents.length} saves in ${win.name.split('_')[1]}, ${wChurn} lines churned at ${(efficiency * 100).toFixed(0)}% eff` });
+                    }
+                }
+            }
+        }
+    }
+    // --- L3: Intent signal flips (Causal Matrix) ---
+    for (let i = 0; i < transitions.length - 1; i++) {
+        const curr = transitions[i];
+        const next = transitions[i + 1];
+        const gapMs = next.t - curr.t;
+        if (gapMs < 4 * 60 * 60 * 1000) { // within 4h
+            if ((curr.intent_signal === 'additive' && next.intent_signal === 'subtractive') ||
+                (curr.intent_signal === 'subtractive' && next.intent_signal === 'additive')) {
+                const s = 15;
+                totalScore += s;
+                episodes.push({ signal: 'SIGNAL_FLIP', t: new Date(next.t).toISOString(), score: s, detail: `Intent flip: ${curr.intent_signal} → ${next.intent_signal} within 4h` });
+            }
+        }
+    }
+    // --- L4: Lifetime efficiency ---
+    const totalChurn = totalAdded + totalRemoved;
+    let lifetime_eff = 1;
+    if (totalChurn > 0) {
+        const netResult = Math.abs(totalAdded - totalRemoved);
+        lifetime_eff = netResult / (totalChurn + 10); // Laplace smoothing
+        if (lifetime_eff < 0.1 && events.length > 20) {
+            const s = 20;
+            totalScore += s;
+            episodes.push({ signal: 'LOW_LIFETIME_EFF', t: new Date(events[events.length - 1].t).toISOString(), score: s, detail: `Historical thrashing: ${(lifetime_eff * 100).toFixed(1)}% lifetime efficiency over ${events.length} edits` });
+        }
+    }
+    // --- L5: Acceleration (Lehman's Law) ---
+    if (events.length >= 5) {
+        const splitIdx = Math.floor(events.length * 0.8);
+        const earlyEvents = events.slice(0, splitIdx);
+        const lateEvents = events.slice(splitIdx);
+        if (earlyEvents.length > 0 && lateEvents.length > 0) {
+            // Floor at 1h minimum to prevent Infinity on bursts
+            const earlyDuration = Math.max((earlyEvents[earlyEvents.length - 1].t - earlyEvents[0].t) / 3600000, 1);
+            const lateDuration = Math.max((lateEvents[lateEvents.length - 1].t - lateEvents[0].t) / 3600000, 1);
+            const rateEarly = earlyEvents.length / earlyDuration;
+            const rateLate = lateEvents.length / lateDuration;
+            if (rateLate > (3 * rateEarly)) {
+                const s = 10;
+                totalScore += s;
+                episodes.push({ signal: 'ACCELERATING', t: new Date(lateEvents[0].t).toISOString(), score: s, detail: `Edit rate accelerated from ${rateEarly.toFixed(1)}/h to ${rateLate.toFixed(1)}/h` });
+            }
+        }
+    }
+    // Deduplicate episodes (same signal + same timestamp = artifact of sliding windows)
+    const uniqueEpisodes = episodes.filter((ep, index, self) => index === self.findIndex((t) => t.signal === ep.signal && t.t === ep.t));
+    return {
+        score: Math.min(Math.round(totalScore), 1000),
+        episodes: uniqueEpisodes,
+        lifetime_eff,
+    };
+}
+/**
+ * Read a ContentStore blob by SHA-256 checksum.
+ * Tries plain .content first, then .content.gz.
+ * Returns null if blob not found.
+ */
+export function readBlobSafe(root, sha256) {
+    if (!sha256 || sha256.length !== 64)
+        return null;
+    try {
+        const blobPath = resolveUnderRoot(root, ".rl4", "snapshots", `${sha256}.content`);
+        if (fs.existsSync(blobPath)) {
+            return fs.readFileSync(blobPath, "utf8");
+        }
+        const blobPathGz = resolveUnderRoot(root, ".rl4", "snapshots", `${sha256}.content.gz`);
+        if (fs.existsSync(blobPathGz)) {
+            const compressed = fs.readFileSync(blobPathGz);
+            return zlib.gunzipSync(compressed).toString("utf-8");
+        }
+    }
+    catch { /* blob unreadable */ }
+    return null;
+}
+// Lines that are pure syntax noise — never use for reversal matching
+const SYNTAX_ONLY = /^\s*[{}();,\[\]]\s*$/;
+/**
+ * Extract lines that were added in `addedBlob` but absent in `removedBlob`.
+ * These are the "reverted lines" — code that was written then undone.
+ * Filters out: short lines (<10 chars), pure syntax, whitespace-only.
+ */
+export function extractRevertedLines(addedBlob, removedBlob) {
+    const addedLines = new Set(addedBlob.split('\n').map(l => l.trim()).filter(l => l.length > 10 && !SYNTAX_ONLY.test(l)));
+    const removedLines = new Set(removedBlob.split('\n').map(l => l.trim()).filter(l => l.length > 10));
+    // Lines in addedBlob that are NOT in removedBlob = the code that was added then reverted
+    const reverted = [];
+    for (const line of addedLines) {
+        if (!removedLines.has(line)) {
+            reverted.push(line);
+        }
+    }
+    return reverted;
+}
+/**
+ * Reconstruct the full mechanical history of a file from RL4 evidence.
+ * PERF: Uses fast sources (intent_graph.json ~5ms, file_index.json ~2ms,
+ * intent_chains.jsonl ~20ms, chat_threads.jsonl ~5ms, activity.jsonl ~30ms with pre-filter).
+ * Total budget: ~64ms. Does NOT read chat_history.jsonl (31MB).
+ * Blob reading limited to last 3 reversals, only if hot_score > 0.5.
+ * Risk model: 5-layer Laplace-smoothed scoring from activity + intent transitions.
+ */
+export function reconstructFileHistory(root, relPath) {
+    var _a, _b, _c, _d, _e, _f, _g, _h;
+    const fileName = relPath.split('/').pop() || relPath;
+    const result = {
+        versions_count: 0,
+        first_seen: '',
+        last_modified: '',
+        reversals: [],
+        chat_mentions: [],
+        dynamic_warnings: [],
+        hot_score: 0,
+        trajectory: 'linear',
+        risk_score: 0,
+        risk_episodes: [],
+        lifetime_efficiency: 1,
+    };
+    // 1. Intent Graph — pre-calculated hot_score, trajectory, reversals count
+    const graphContent = readFileSafe(resolveUnderRoot(root, ".rl4", "snapshots", "intent_graph.json"))
+        || readFileSafe(resolveUnderRoot(root, ".rl4", "intent_graph.json"));
+    if (graphContent) {
+        try {
+            const graph = JSON.parse(graphContent);
+            const chains = graph.chains || graph.hot_files || [];
+            const entry = chains.find((c) => { var _a; return c.file === relPath || ((_a = c.file) === null || _a === void 0 ? void 0 : _a.endsWith('/' + relPath)); });
+            if (entry) {
+                result.hot_score = (_a = entry.hot_score) !== null && _a !== void 0 ? _a : 0;
+                result.trajectory = (_b = entry.trajectory) !== null && _b !== void 0 ? _b : 'linear';
+                result.versions_count = (_c = entry.versions) !== null && _c !== void 0 ? _c : 0;
+                if (entry.last_reversal) {
+                    result.reversals.push({
+                        t: '',
+                        added_sha: '', // will be enriched from intent_chains
+                        removed_sha: '',
+                        reverted_lines: (_d = entry.last_reversal.reverted_lines) !== null && _d !== void 0 ? _d : 0,
+                        time_gap_hours: (_e = entry.last_reversal.time_gap_hours) !== null && _e !== void 0 ? _e : 0,
+                    });
+                }
+            }
+        }
+        catch { /* malformed graph */ }
+    }
+    // 2. File Index — version count from ContentStore
+    try {
+        const fileIndexPath = resolveUnderRoot(root, ".rl4", "snapshots", "file_index.json");
+        const indexRaw = readFileSafe(fileIndexPath);
+        if (indexRaw) {
+            const index = JSON.parse(indexRaw);
+            // Try exact match first, then endsWith
+            const versions = index[relPath]
+                || ((_f = Object.entries(index).find(([k]) => k.endsWith('/' + relPath))) === null || _f === void 0 ? void 0 : _f[1])
+                || [];
+            if (versions.length > 0) {
+                result.versions_count = Math.max(result.versions_count, versions.length);
+            }
+        }
+    }
+    catch { /* non-critical */ }
+    // 3. Intent Chains — transitions for THIS file only (fast string pre-filter)
+    const reversalTransitions = [];
+    const allIntentTransitions = []; // ALL transitions for risk model L3
+    try {
+        const chainsPath = resolveUnderRoot(root, ".rl4", "evidence", "intent_chains.jsonl");
+        const chainsRaw = readFileSafe(chainsPath);
+        if (chainsRaw) {
+            const lines = chainsRaw.split('\n');
+            for (const line of lines) {
+                // Fast pre-filter: skip lines that don't mention this file (avoids JSON.parse)
+                if (!line.includes(fileName))
+                    continue;
+                try {
+                    const ev = JSON.parse(line);
+                    if (ev.file !== relPath && !((_g = ev.file) === null || _g === void 0 ? void 0 : _g.endsWith('/' + relPath)))
+                        continue;
+                    if (!result.first_seen || ev.t < result.first_seen)
+                        result.first_seen = ev.t;
+                    if (!result.last_modified || ev.t > result.last_modified)
+                        result.last_modified = ev.t;
+                    // Collect ALL transitions for computeFileRisk L3 (signal flips)
+                    if (ev.intent_signal) {
+                        allIntentTransitions.push({ t: new Date(ev.t).getTime(), intent_signal: ev.intent_signal });
+                    }
+                    // Track subtractive/rewrite transitions (potential reversals)
+                    if (ev.intent_signal === 'subtractive' || ev.intent_signal === 'rewrite') {
+                        reversalTransitions.push({
+                            t: ev.t,
+                            from_sha256: ev.from_sha256,
+                            to_sha256: ev.to_sha256,
+                            delta: ev.delta || { linesAdded: 0, linesRemoved: 0 },
+                            intent_signal: ev.intent_signal,
+                        });
+                    }
+                }
+                catch { /* skip malformed line */ }
+            }
+        }
+    }
+    catch { /* non-critical */ }
+    // Build real reversals from intent_chains transitions
+    // A reversal = subtractive transition where linesRemoved > linesAdded
+    if (reversalTransitions.length > 0) {
+        // Keep only recent reversals (last 5)
+        const recentReversals = reversalTransitions
+            .filter(t => t.delta.linesRemoved > t.delta.linesAdded && t.from_sha256)
+            .slice(-5);
+        result.reversals = recentReversals.map(t => ({
+            t: t.t,
+            added_sha: t.from_sha256, // the version BEFORE the reversal (had the added code)
+            removed_sha: t.to_sha256, // the version AFTER the reversal (code was removed)
+            reverted_lines: t.delta.linesRemoved - t.delta.linesAdded,
+            time_gap_hours: 0, // computed below if we have timestamps
+        }));
+    }
+    // 3b. Activity events — fuel for the Universal Risk Model (Budget: <30ms)
+    const activityEvents = [];
+    try {
+        const actPath = resolveUnderRoot(root, ".rl4", "evidence", "activity.jsonl");
+        if (fs.existsSync(actPath)) {
+            const actRaw = fs.readFileSync(actPath, 'utf-8');
+            for (const line of actRaw.split('\n')) {
+                // CRITICAL OPTIMIZATION: raw string pre-filter before JSON.parse (~99% skip)
+                if (!line.includes(fileName))
+                    continue;
+                try {
+                    const ev = JSON.parse(line);
+                    if (ev.path !== relPath && !((_h = ev.path) === null || _h === void 0 ? void 0 : _h.endsWith('/' + relPath)))
+                        continue;
+                    if (ev.kind === 'save') {
+                        activityEvents.push({
+                            t: new Date(ev.t).getTime(),
+                            linesAdded: ev.linesAdded || 0,
+                            linesRemoved: ev.linesRemoved || 0,
+                        });
+                    }
+                }
+                catch { /* skip corrupted lines */ }
+            }
+        }
+    }
+    catch { /* fail soft if activity.jsonl unreadable */ }
+    // 3c. Universal Risk Model — 5-layer Laplace-smoothed scoring
+    const riskData = computeFileRisk(activityEvents, allIntentTransitions);
+    result.risk_score = riskData.score;
+    result.risk_episodes = riskData.episodes;
+    result.lifetime_efficiency = riskData.lifetime_eff;
+    // 4. Chat Threads — discussions mentioning this file (fast, 950 lines)
+    try {
+        const chatPath = resolveUnderRoot(root, ".rl4", "evidence", "chat_threads.jsonl");
+        const chatRaw = readFileSafe(chatPath);
+        if (chatRaw) {
+            const chatLines = chatRaw.split('\n').filter(Boolean);
+            for (const line of chatLines) {
+                if (!line.includes(fileName))
+                    continue; // fast pre-filter
+                try {
+                    const thread = JSON.parse(line);
+                    const title = thread.title || '';
+                    const topics = thread.topics || [];
+                    const allText = title + ' ' + topics.join(' ');
+                    if ((allText.includes(fileName) || allText.includes(relPath))
+                        && !title.startsWith('<ide_') && title.length > 5
+                        && !/^You are |^Thoroughness:|^I need to |^Explore |^Search |^<command|^Thoroughly |^Read these |^Examine /i.test(title)) {
+                        result.chat_mentions.push({
+                            thread_title: title.slice(0, 200),
+                            source: thread.source || 'chat',
+                            date: thread.last_ts || thread.first_ts || '',
+                        });
+                    }
+                }
+                catch { /* skip */ }
+            }
+            // Limit to 5 most recent
+            if (result.chat_mentions.length > 5) {
+                result.chat_mentions = result.chat_mentions.slice(-5);
+            }
+        }
+    }
+    catch { /* non-critical */ }
+    // 5. Compute hot_score from version count if intent_graph didn't provide it
+    if (result.hot_score === 0 && result.versions_count > 0) {
+        result.hot_score = Math.min(1, result.versions_count / 100); // 100 versions = max hot
+    }
+    // 6. Generate dynamic warnings — risk-based (primary) + mechanical facts (complementary)
+    // 6a. Risk Model warnings (quantitative, from computeFileRisk)
+    if (result.risk_score > 100) {
+        const topSignals = [...new Set(result.risk_episodes.map(e => e.signal))].slice(0, 3);
+        result.dynamic_warnings.push(`⚠️ HIGH RISK (score: ${result.risk_score}): ${result.risk_episodes.length} anomaly episodes. Signals: ${topSignals.join(', ')}. Edit with extreme care and verify edge cases.`);
+    }
+    else if (result.risk_score > 30) {
+        result.dynamic_warnings.push(`⚠️ ELEVATED RISK (score: ${result.risk_score}): Historical rework detected. Proceed carefully.`);
+    }
+    // 6b. Reversal warning (hard guardrail — used by /validate for blob diff DENY)
+    if (result.reversals.length > 0) {
+        const lastRev = result.reversals[result.reversals.length - 1];
+        result.dynamic_warnings.push(`⏪ ROLLBACK HISTORY: ${result.reversals.length} reversal(s). Last removed ${lastRev.reverted_lines} lines. Do not reintroduce reverted code.`);
+    }
+    // 6c. Hot file + oscillating + chat (complementary context)
+    if (result.versions_count > 50) {
+        result.dynamic_warnings.push(`HOT FILE: ${result.versions_count} versions tracked (hot_score: ${result.hot_score.toFixed(2)}).`);
+    }
+    if (result.trajectory === 'oscillating') {
+        result.dynamic_warnings.push(`OSCILLATING PATTERN: Repeated back-and-forth changes detected.`);
+    }
+    if (result.chat_mentions.length > 0) {
+        const titles = result.chat_mentions.slice(0, 3).map(m => m.thread_title).filter(Boolean);
+        if (titles.length > 0) {
+            result.dynamic_warnings.push(`DISCUSSED IN CHAT: ${titles.join('; ')}.`);
+        }
+    }
+    return result;
+}
 /**
  * Append an agent action to agent_actions.jsonl for proof chain.
  */
 export function appendAgentAction(root, action) {
     const actionsPath = resolveUnderRoot(root, ".rl4", "evidence", "agent_actions.jsonl");
-    const dir = path.dirname(actionsPath);
-    if (!fs.existsSync(dir))
-        fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(actionsPath, JSON.stringify(action) + '\n');
+    lockedAppend(actionsPath, JSON.stringify(action));
 }
 /** Read causal_links.jsonl → array of CausalLink */
 export function readCausalLinks(root) {
@@ -522,10 +921,7 @@ export function loadCREState(root) {
 /** Save CRE state to .rl4/.internal/cre_state.json */
 export function saveCREState(root, state) {
     const p = resolveUnderRoot(root, ".rl4", ".internal", "cre_state.json");
-    const dir = path.dirname(p);
-    if (!fs.existsSync(dir))
-        fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(p, JSON.stringify(state, null, 2));
+    lockedWrite(p, JSON.stringify(state, null, 2));
 }
 /** Read recent burst sessions (last N) */
 export function readRecentBursts(root, count) {
@@ -556,6 +952,8 @@ export function buildWorkspaceLessons(root) {
             const trimmed = line.replace(/^-\s*/, "").trim();
             if (!trimmed.includes("AVOID"))
                 continue;
+            if (/^#{1,3}\s/.test(trimmed))
+                continue; // Skip markdown headers like "## AVOID"
             const text = trimmed.replace(/^AVOID:\s*/i, "").trim();
             if (text.length < 5)
                 continue;
@@ -643,4 +1041,44 @@ export function buildWorkspaceLessons(root) {
         });
     }
     return lessons;
+}
+// ── Path rewriting for remote workspace context ──────────────────────────
+/**
+ * Rewrite absolute paths in remote context content to local equivalents.
+ * Called when a user reads another user's context via Supabase — the evidence
+ * and timeline contain absolute paths from the owner's machine.
+ *
+ * Detection: finds the first absolute path (/Users/X/... or /home/X/...) and
+ * infers the remote root from a `/.rl4/` boundary. If the remote root differs
+ * from localRoot, all occurrences are replaced.
+ *
+ * No-op when: no absolute paths, same root, or root can't be detected.
+ */
+export function rewriteRemotePaths(content, localRoot) {
+    if (!content || !localRoot)
+        return content;
+    // Match first absolute path (Unix-like)
+    const absPathRegex = /(\/(?:Users|home|root)\/[^\s/]+(?:\/[^\s,\n`'"[\](){}]+)+)/;
+    const match = absPathRegex.exec(content);
+    if (!match)
+        return content;
+    const firstPath = match[1];
+    // Detect remote root via .rl4 boundary
+    let remoteRoot = null;
+    const rl4Idx = firstPath.indexOf("/.rl4/");
+    if (rl4Idx >= 0) {
+        remoteRoot = firstPath.slice(0, rl4Idx);
+    }
+    else {
+        // Fallback: use local workspace basename to find boundary
+        const localBasename = path.basename(localRoot);
+        const basenameIdx = firstPath.indexOf("/" + localBasename + "/");
+        if (basenameIdx >= 0) {
+            remoteRoot = firstPath.slice(0, basenameIdx) + "/" + localBasename;
+        }
+    }
+    if (!remoteRoot || remoteRoot === localRoot)
+        return content;
+    // Replace all occurrences
+    return content.split(remoteRoot).join(localRoot);
 }

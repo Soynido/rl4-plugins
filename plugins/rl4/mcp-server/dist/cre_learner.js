@@ -9,12 +9,14 @@ import * as fs from "fs";
 import * as path from "path";
 import * as crypto from "crypto";
 import { resolveUnderRoot } from "./safePath.js";
+import { lockedAppend, lockedReadModifyWrite } from "./utils/fs_lock.js";
 import { createEmptyCREState, CRE_PARAMS, } from "./causal_engine.js";
 import { readFileSafe, readRecentBursts, getLastActivityTimestamp, loadCREState, saveCREState, } from "./workspace.js";
 // ── Hyperparameters ──────────────────────────────────────────────────────────
 const REVERSAL_HORIZON = 5; // events
 const REWORK_WINDOW = 60; // minutes
-const ACCEPTED_NO_TOUCH = 60; // minutes
+const ACCEPTED_NO_TOUCH = 60; // minutes — write-path interventions
+const ACCEPTED_NO_TOUCH_GUARDRAIL = 15; // minutes — guardrail (ask-mode) interventions resolve faster
 const INDETERMINATE_TIMEOUT = 120; // minutes
 const SESSION_GAP = 20; // minutes
 const SAFETY_WINDOW_DAYS = 7;
@@ -53,10 +55,7 @@ export function logIntervention(root, file, selection, burstId = null) {
         pi_log: piLog,
     };
     const logPath = getInterventionLogPath(root);
-    const dir = path.dirname(logPath);
-    if (!fs.existsSync(dir))
-        fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(logPath, JSON.stringify(intervention) + "\n");
+    lockedAppend(logPath, JSON.stringify(intervention));
     return id;
 }
 // ── Outcome Resolution ───────────────────────────────────────────────────────
@@ -66,41 +65,42 @@ export function logIntervention(root, file, selection, burstId = null) {
  */
 export function resolveOutcomes(root, files) {
     const logPath = getInterventionLogPath(root);
-    const raw = readFileSafe(logPath);
-    if (!raw)
+    if (!fs.existsSync(logPath))
         return;
-    const lines = raw.trim().split("\n").filter(Boolean);
-    let changed = false;
-    const updated = lines.map(line => {
-        try {
-            const intervention = JSON.parse(line);
-            if (intervention.outcome !== "pending")
-                return line;
-            if (!files.includes(intervention.file))
-                return line;
-            const resolved = tryResolve(root, intervention);
-            if (resolved) {
-                changed = true;
-                return JSON.stringify(resolved);
-            }
-            return line;
-        }
-        catch {
-            return line;
-        }
-    });
-    if (changed) {
-        fs.writeFileSync(logPath, updated.join("\n") + "\n");
-        // Update CRE state for resolved interventions
-        for (const line of updated) {
+    // Collect resolved interventions outside the lock to minimize lock hold time.
+    // CRE state updates (saveCREState) acquire their own lock on a different file.
+    const resolvedInterventions = [];
+    lockedReadModifyWrite(logPath, (raw) => {
+        if (!raw.trim())
+            return raw;
+        const lines = raw.trim().split("\n").filter(Boolean);
+        let changed = false;
+        const updated = lines.map(line => {
             try {
                 const intervention = JSON.parse(line);
-                if (intervention.outcome !== "pending" && intervention.outcome !== "indeterminate"
-                    && intervention.outcome_resolved_at) {
-                    updateCREStateFromIntervention(root, intervention);
+                if (intervention.outcome !== "pending")
+                    return line;
+                if (files && !files.includes(intervention.file))
+                    return line;
+                const resolved = tryResolve(root, intervention);
+                if (resolved) {
+                    changed = true;
+                    resolvedInterventions.push(resolved);
+                    return JSON.stringify(resolved);
                 }
+                return line;
             }
-            catch { /* skip */ }
+            catch {
+                return line;
+            }
+        });
+        return changed ? updated.join("\n") + "\n" : raw;
+    });
+    // Update CRE state OUTSIDE the lock — saveCREState uses its own lockedWrite
+    for (const intervention of resolvedInterventions) {
+        if (intervention.outcome !== "pending" && intervention.outcome !== "indeterminate"
+            && intervention.outcome_resolved_at) {
+            updateCREStateFromIntervention(root, intervention);
         }
     }
 }
@@ -110,6 +110,9 @@ function tryResolve(root, intervention) {
     const minutes = elapsed / 60000;
     const noTouch = noTouchMinutes(root, intervention.file, intervention.timestamp);
     const committed = wasCommitted(root, intervention.file, intervention.timestamp);
+    // Guardrail (ask-mode) interventions have burst_id === null and no subsequent saves.
+    // They resolve faster: 15min no-touch or 20min session gap = accepted.
+    const isGuardrail = intervention.burst_id === null;
     // Priority 1: reversed_fast
     if (detectReversalSince(root, intervention.file, intervention.timestamp, REVERSAL_HORIZON)) {
         return resolveWith(intervention, "reversed_fast", committed, noTouch);
@@ -119,7 +122,8 @@ function tryResolve(root, intervention) {
         return resolveWith(intervention, "reworked", committed, noTouch);
     }
     // Priority 3: accepted
-    if (noTouch >= ACCEPTED_NO_TOUCH
+    const acceptThreshold = isGuardrail ? ACCEPTED_NO_TOUCH_GUARDRAIL : ACCEPTED_NO_TOUCH;
+    if (noTouch >= acceptThreshold
         || sessionEndedStably(root, intervention.file, intervention.timestamp)
         || (committed && noTouch >= 15)) {
         return resolveWith(intervention, "accepted", committed, noTouch);

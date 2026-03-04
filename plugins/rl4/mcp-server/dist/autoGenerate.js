@@ -6,12 +6,14 @@
  *   - sessions.jsonl   (bursts: files, pattern, duration)
  *   - activity.jsonl    (file saves: path, sha256, linesAdded/Removed)
  *   - chat_threads.jsonl (thread summaries: title, count, timestamps)
- *   - chat_history.jsonl (message count only — not read line by line)
+ *   - chat_history.jsonl (message count + thread synthesis for orphan messages)
  *   - file_index.json   (content store: file → checksum)
  */
 import * as fs from "fs";
 import * as path from "path";
 import { resolveUnderRoot } from "./safePath.js";
+import { lockedWrite, lockedAppend } from "./utils/fs_lock.js";
+import { readIntentGraphData } from "./workspace.js";
 // ---------------------------------------------------------------------------
 // JSONL helpers
 // ---------------------------------------------------------------------------
@@ -110,6 +112,177 @@ function clusterBurstsIntoSessions(bursts, dayEvents, dayThreads) {
         }
     }
     return sessions;
+}
+function inferPatternFromFiles(files) {
+    var _a;
+    let test = 0, docs = 0, config = 0, feature = 0;
+    for (const f of files) {
+        if (!f)
+            continue;
+        const name = (_a = f.split("/").pop()) !== null && _a !== void 0 ? _a : f;
+        if (/\.(test|spec)\./i.test(name) || /__(tests|mocks)__/i.test(f))
+            test++;
+        else if (/\.(md|txt|rst)$/i.test(name))
+            docs++;
+        else if (/\.(json|yaml|yml|toml|env|mdc|gitignore)$/i.test(name) || /config/i.test(name))
+            config++;
+        else
+            feature++;
+    }
+    const counts = [
+        { type: "test", count: test },
+        { type: "docs", count: docs },
+        { type: "config", count: config },
+        { type: "feature", count: feature },
+    ].sort((a, b) => b.count - a.count);
+    const top = counts[0];
+    if (top.count === 0)
+        return { type: "unknown", confidence: 0.3, indicators: [] };
+    return { type: top.type, confidence: 0.7, indicators: [`${top.count}/${files.length}_files`] };
+}
+/**
+ * Create synthetic burst entries in sessions.jsonl from activity.jsonl entries
+ * that have no burst_id (e.g., G2E git commits). Idempotent via deterministic IDs.
+ * Uses lockedAppend (SWA-compliant) for writes.
+ */
+function synthesizeMissingSessions(evDir) {
+    const sessionsPath = path.join(evDir, "sessions.jsonl");
+    const activityPath = path.join(evDir, "activity.jsonl");
+    if (!fs.existsSync(activityPath))
+        return;
+    // Read all activity events — handle both `t` and `timestamp` field names
+    const raw = fs.readFileSync(activityPath, "utf8");
+    const allEvents = [];
+    for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("{"))
+            continue;
+        try {
+            const obj = JSON.parse(trimmed);
+            // Normalize: G2E uses `timestamp`/`file`, realtime uses `t`/`path`
+            if (!obj.t && obj.timestamp)
+                obj.t = obj.timestamp;
+            if (!obj.path && obj.file)
+                obj.path = obj.file;
+            if (!obj.t)
+                continue;
+            allEvents.push(obj);
+        }
+        catch { /* skip malformed */ }
+    }
+    // Get existing burst IDs to check idempotence
+    const existingBursts = readJsonl(sessionsPath, "burst_id");
+    const existingIds = new Set(existingBursts.map(b => b.burst_id));
+    // Only process events without burst_id (G2E data, etc.) and with a valid path
+    const orphanEvents = allEvents.filter(e => !e.burst_id && e.path);
+    if (orphanEvents.length === 0)
+        return;
+    // Group by day
+    const byDay = new Map();
+    for (const e of orphanEvents) {
+        const day = e.t.slice(0, 10);
+        if (!byDay.has(day))
+            byDay.set(day, []);
+        byDay.get(day).push(e);
+    }
+    let totalNew = 0;
+    for (const [day, dayEvents] of byDay) {
+        // Cluster by 30-min gaps (same algorithm as real burst detection)
+        const sorted = dayEvents.sort((a, b) => a.t.localeCompare(b.t));
+        const clusters = [];
+        let cluster = [sorted[0]];
+        for (let i = 1; i < sorted.length; i++) {
+            const gap = new Date(sorted[i].t).getTime() - new Date(sorted[i - 1].t).getTime();
+            if (gap > SESSION_GAP_MS) {
+                clusters.push(cluster);
+                cluster = [sorted[i]];
+            }
+            else {
+                cluster.push(sorted[i]);
+            }
+        }
+        clusters.push(cluster);
+        // Build synthetic bursts
+        for (let idx = 0; idx < clusters.length; idx++) {
+            const c = clusters[idx];
+            const burstId = `synthetic-${day}-${idx}`;
+            if (existingIds.has(burstId))
+                continue; // idempotent
+            const files = [...new Set(c.map(e => e.path).filter(Boolean))];
+            const firstTs = c[0].t;
+            const lastTs = c[c.length - 1].t;
+            const durationMs = new Date(lastTs).getTime() - new Date(firstTs).getTime();
+            const burst = {
+                burst_id: burstId,
+                t: firstTs,
+                files,
+                pattern: inferPatternFromFiles(files),
+                events_count: c.length,
+                duration_ms: Math.max(durationMs, 1000),
+            };
+            lockedAppend(sessionsPath, JSON.stringify(burst));
+            existingIds.add(burstId);
+            totalNew++;
+        }
+    }
+    if (totalNew > 0) {
+        console.error(`[RL4 Synthesize] Created ${totalNew} synthetic sessions from orphan activity events`);
+    }
+}
+function synthesizeThreadsFromChat(evDir, existingThreads) {
+    const existingKeys = new Set(existingThreads.map(t => t.thread_key));
+    const chatPath = path.join(evDir, "chat_history.jsonl");
+    if (!fs.existsSync(chatPath))
+        return [];
+    const raw = fs.readFileSync(chatPath, "utf8");
+    const threadMap = new Map();
+    for (const line of raw.split("\n")) {
+        const trimmed = line.trim();
+        if (!trimmed || !trimmed.startsWith("{"))
+            continue;
+        try {
+            const m = JSON.parse(trimmed);
+            const tid = m.thread_id;
+            if (!tid || existingKeys.has(tid))
+                continue;
+            const ms = m.unix_ms || new Date(m.timestamp || m.t || "").getTime();
+            if (!ms || isNaN(ms) || ms < 1577836800000)
+                continue; // < 2020-01-01
+            const existing = threadMap.get(tid);
+            if (!existing) {
+                threadMap.set(tid, {
+                    count: 1,
+                    firstMs: ms,
+                    lastMs: ms,
+                    firstUserMsg: m.role === "user" ? (m.content || "").slice(0, 80) : "",
+                });
+            }
+            else {
+                existing.count++;
+                if (ms < existing.firstMs)
+                    existing.firstMs = ms;
+                if (ms > existing.lastMs)
+                    existing.lastMs = ms;
+                if (!existing.firstUserMsg && m.role === "user") {
+                    existing.firstUserMsg = (m.content || "").slice(0, 80);
+                }
+            }
+        }
+        catch { /* skip malformed */ }
+    }
+    if (threadMap.size === 0)
+        return [];
+    const syntheticThreads = [];
+    for (const [key, data] of threadMap) {
+        syntheticThreads.push({
+            thread_key: key,
+            title: data.firstUserMsg || key,
+            count: data.count,
+            firstMs: data.firstMs,
+            lastMs: data.lastMs,
+        });
+    }
+    return syntheticThreads;
 }
 // ---------------------------------------------------------------------------
 // Group data by day
@@ -321,8 +494,28 @@ export function rebuildTimeline(root) {
     var _a, _b, _c, _d, _e, _f, _g, _h;
     const evDir = resolveUnderRoot(root, ".rl4", "evidence");
     const bursts = readJsonl(path.join(evDir, "sessions.jsonl"), "burst_id");
-    const events = readJsonl(path.join(evDir, "activity.jsonl"), "t");
-    const threads = readJsonl(path.join(evDir, "chat_threads.jsonl"), "thread_key");
+    // Read activity events — normalize G2E `timestamp` field to `t`
+    const rawEvents = readJsonl(path.join(evDir, "activity.jsonl"), "t");
+    const rawEventsTs = readJsonl(path.join(evDir, "activity.jsonl"), "timestamp");
+    const seenEvt = new Set();
+    const events = [];
+    for (const e of [...rawEvents, ...rawEventsTs]) {
+        if (!e.t && e.timestamp)
+            e.t = e.timestamp;
+        if (!e.path && e.file)
+            e.path = e.file;
+        if (!e.t || !e.path)
+            continue;
+        const key = `${e.t}|${e.path}`;
+        if (seenEvt.has(key))
+            continue;
+        seenEvt.add(key);
+        events.push(e);
+    }
+    // Read threads + synthesize missing ones from chat_history (in-memory only)
+    const fileThreads = readJsonl(path.join(evDir, "chat_threads.jsonl"), "thread_key");
+    const syntheticThreads = synthesizeThreadsFromChat(evDir, fileThreads);
+    const threads = [...fileThreads, ...syntheticThreads];
     const days = groupByDay(bursts, events, threads);
     const now = new Date().toISOString().slice(0, 19).replace("T", " ");
     const totalMsgsAll = threads.reduce((sum, t) => sum + t.count, 0);
@@ -485,8 +678,28 @@ export function rebuildEvidence(root) {
     const evDir = resolveUnderRoot(root, ".rl4", "evidence");
     const rl4Dir = resolveUnderRoot(root, ".rl4");
     const bursts = readJsonl(path.join(evDir, "sessions.jsonl"), "burst_id");
-    const events = readJsonl(path.join(evDir, "activity.jsonl"), "t");
-    const threads = readJsonl(path.join(evDir, "chat_threads.jsonl"), "thread_key");
+    // Read activity events — normalize G2E `timestamp` field to `t`
+    const rawEventsEv = readJsonl(path.join(evDir, "activity.jsonl"), "t");
+    const rawEventsTsEv = readJsonl(path.join(evDir, "activity.jsonl"), "timestamp");
+    const seenEvtEv = new Set();
+    const events = [];
+    for (const e of [...rawEventsEv, ...rawEventsTsEv]) {
+        if (!e.t && e.timestamp)
+            e.t = e.timestamp;
+        if (!e.path && e.file)
+            e.path = e.file;
+        if (!e.t || !e.path)
+            continue;
+        const key = `${e.t}|${e.path}`;
+        if (seenEvtEv.has(key))
+            continue;
+        seenEvtEv.add(key);
+        events.push(e);
+    }
+    // Read threads + synthesize missing ones from chat_history (in-memory only)
+    const fileThreadsEv = readJsonl(path.join(evDir, "chat_threads.jsonl"), "thread_key");
+    const syntheticThreadsEv = synthesizeThreadsFromChat(evDir, fileThreadsEv);
+    const threads = [...fileThreadsEv, ...syntheticThreadsEv];
     const msgCount = countLines(path.join(evDir, "chat_history.jsonl"));
     // File index for blob count
     let blobCount = 0;
@@ -1041,18 +1254,191 @@ export function queryDateRange(root, dateFrom, dateTo) {
     return result;
 }
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Chat-mined AVOID enrichment for skills.mdc
+// ---------------------------------------------------------------------------
+function enrichSkillsFromChat(root) {
+    let added = 0;
+    try {
+        const chatPath = resolveUnderRoot(root, ".rl4", "evidence", "chat_history.jsonl");
+        const skillsPath = resolveUnderRoot(root, ".rl4", "skills.mdc");
+        if (!fs.existsSync(chatPath))
+            return 0;
+        const raw = fs.readFileSync(chatPath, "utf-8");
+        const lines = raw.split("\n").filter(Boolean);
+        const recentLines = lines.slice(-500);
+        const bugFixPatterns = [
+            /\bfix(?:ed|ing|es)?\s+(?:the\s+)?(?:bug|issue|regression|truncat|overflow|layout|CSS|broken|crash)/i,
+            /\bbroke(?:n)?\b.*\b(?:by|when|after)\b/i,
+            /\breverted|rolled\s*back\b/i,
+            /\bregression\b/i,
+        ];
+        const fileRefRegex = /\b([\w/.-]+\.(?:ts|css|js|tsx|jsx|json|html|mdc))\b/g;
+        const categoryTag = (fp) => {
+            if (/\.css$|styles/i.test(fp))
+                return "[CSS]";
+            if (/media\/app\.js|\.html$/i.test(fp))
+                return "[UI]";
+            if (/mcp-server/i.test(fp))
+                return "[MCP]";
+            if (/src\//i.test(fp))
+                return "[EXT]";
+            return "";
+        };
+        let content = fs.existsSync(skillsPath) ? fs.readFileSync(skillsPath, "utf-8") : "";
+        for (const line of recentLines) {
+            try {
+                const msg = JSON.parse(line);
+                const text = msg.content || msg.textDescription || "";
+                if (!text || text.length < 20)
+                    continue;
+                if (!bugFixPatterns.some((p) => p.test(text)))
+                    continue;
+                const fileRefs = [...text.matchAll(fileRefRegex)].map((m) => m[1]);
+                if (fileRefs.length === 0)
+                    continue;
+                const lesson = text.replace(/\n/g, " ").slice(0, 120).trim();
+                for (const fp of [...new Set(fileRefs)].slice(0, 3)) {
+                    if (content.includes("auto-mined") && content.includes(fp))
+                        continue;
+                    const tag = categoryTag(fp);
+                    const avoidLine = `- AVOID ${tag}: ${lesson} — ${fp} (auto-mined ${new Date().toISOString().slice(0, 10)})`;
+                    const avoidSection = "## AVOID";
+                    if (content.includes(avoidSection)) {
+                        content = content.replace(avoidSection, `${avoidSection}\n${avoidLine}`);
+                    }
+                    else {
+                        content += `\n\n${avoidSection}\n${avoidLine}\n`;
+                    }
+                    added++;
+                }
+            }
+            catch { /* skip */ }
+        }
+        if (added > 0) {
+            lockedWrite(skillsPath, content);
+            console.log(`[RL4 rebuildAll] enrichSkillsFromChat: added ${added} AVOID pattern(s)`);
+        }
+    }
+    catch (e) {
+        console.debug("[RL4 rebuildAll] enrichSkillsFromChat failed:", e === null || e === void 0 ? void 0 : e.message);
+    }
+    return added;
+}
+// ---------------------------------------------------------------------------
+// Auto-enrich skills.mdc with hot-file warnings, coupled-file rules, and decay
+// ---------------------------------------------------------------------------
+function enrichSkillsAutoUpdate(root) {
+    let changes = 0;
+    try {
+        const skillsPath = resolveUnderRoot(root, ".rl4", "skills.mdc");
+        let content = fs.existsSync(skillsPath) ? fs.readFileSync(skillsPath, "utf-8") : "";
+        const ig = readIntentGraphData(root);
+        if (ig && ig.chains) {
+            // Hot-file auto-AVOID: hot_score > 0.7
+            for (const chain of ig.chains) {
+                if (chain.hot_score <= 0.7)
+                    continue;
+                const tag = /\.css$|styles/i.test(chain.file) ? "[CSS]" : /media\/app\.js/i.test(chain.file) ? "[UI]" : /mcp-server/i.test(chain.file) ? "[MCP]" : "[HOT]";
+                if (content.includes(`[HOT]`) && content.includes(chain.file))
+                    continue;
+                if (content.includes(tag) && content.includes(chain.file) && content.includes("hot_score"))
+                    continue;
+                const avoidLine = `- AVOID ${tag}: Modifying \`${chain.file}\` without checking recent changes — hot_score: ${chain.hot_score.toFixed(2)}, ${chain.versions || "?"} versions (auto-enriched ${new Date().toISOString().slice(0, 10)})`;
+                const avoidSection = "## AVOID";
+                if (content.includes(avoidSection)) {
+                    content = content.replace(avoidSection, `${avoidSection}\n${avoidLine}`);
+                }
+                else {
+                    content += `\n\n${avoidSection}\n${avoidLine}\n`;
+                }
+                changes++;
+            }
+            // Coupled-file DO rules from coupling_clusters
+            const coupling = ig.coupling_clusters || ig.coupling || [];
+            for (const cluster of coupling) {
+                const files = cluster.files || [];
+                if (files.length < 2)
+                    continue;
+                const key = files.slice(0, 2).sort().join(" + ");
+                if (content.includes(key))
+                    continue;
+                const doLine = `- DO: When modifying \`${files[0]}\`, also review \`${files[1]}\` — historically coupled (auto-enriched ${new Date().toISOString().slice(0, 10)})`;
+                const doSection = "## DO";
+                if (content.includes(doSection)) {
+                    content = content.replace(doSection, `${doSection}\n${doLine}`);
+                }
+                else {
+                    content += `\n\n${doSection}\n${doLine}\n`;
+                }
+                changes++;
+            }
+        }
+        // Decay: mark stale auto-mined entries (> 30 days)
+        const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+        const staleRegex = /\(auto-(?:mined|enriched) (\d{4}-\d{2}-\d{2})\)/g;
+        let match;
+        while ((match = staleRegex.exec(content)) !== null) {
+            const dateStr = match[1];
+            if (dateStr < thirtyDaysAgo && !content.includes(`[stale] ${match[0]}`)) {
+                content = content.replace(match[0], `[stale] ${match[0]}`);
+                changes++;
+            }
+        }
+        // Remove entries referencing deleted files (only auto-generated ones)
+        const autoLines = content.split("\n");
+        const filteredLines = [];
+        for (const line of autoLines) {
+            if (line.includes("auto-mined") || line.includes("auto-enriched")) {
+                const fileMatch = line.match(/`([^`]+\.\w+)`/);
+                if (fileMatch) {
+                    const checkPath = path.join(root, fileMatch[1]);
+                    if (!fs.existsSync(checkPath)) {
+                        changes++;
+                        continue; // skip deleted file entries
+                    }
+                }
+            }
+            filteredLines.push(line);
+        }
+        content = filteredLines.join("\n");
+        if (changes > 0) {
+            lockedWrite(skillsPath, content);
+            console.log(`[RL4 rebuildAll] enrichSkillsAutoUpdate: ${changes} change(s)`);
+        }
+    }
+    catch (e) {
+        console.debug("[RL4 rebuildAll] enrichSkillsAutoUpdate failed:", e === null || e === void 0 ? void 0 : e.message);
+    }
+    return changes;
+}
 // PUBLIC: rebuild both files
 // ---------------------------------------------------------------------------
 export function rebuildAll(root) {
+    // Step 0: Synthesize missing sessions from G2E activity data (idempotent)
+    try {
+        const evDir = resolveUnderRoot(root, ".rl4", "evidence");
+        synthesizeMissingSessions(evDir);
+    }
+    catch (e) {
+        console.error("[RL4 rebuildAll] Session synthesis failed (non-fatal):", e === null || e === void 0 ? void 0 : e.message);
+    }
     const timelineContent = rebuildTimeline(root);
     const evidenceContent = rebuildEvidence(root);
     const timelinePath = resolveUnderRoot(root, ".rl4", "timeline.md");
     const evidencePath = resolveUnderRoot(root, ".rl4", "evidence.md");
-    // Ensure .rl4 dir exists
-    const rl4Dir = resolveUnderRoot(root, ".rl4");
-    if (!fs.existsSync(rl4Dir))
-        fs.mkdirSync(rl4Dir, { recursive: true });
-    fs.writeFileSync(timelinePath, timelineContent, "utf8");
-    fs.writeFileSync(evidencePath, evidenceContent, "utf8");
+    lockedWrite(timelinePath, timelineContent);
+    lockedWrite(evidencePath, evidenceContent);
+    // Step 2: DISABLED — enrichSkillsFromChat() was the source of skills.mdc pollution
+    // (auto-mined session summaries, system prompts as AVOID patterns).
+    // Replaced by reconstructFileHistory() dynamic warnings (workspace.ts).
+    // enrichSkillsFromChat(root);
+    // Step 3: Auto-update skills.mdc with hot-file/coupled-file/decay
+    try {
+        enrichSkillsAutoUpdate(root);
+    }
+    catch (e) {
+        console.error("[RL4 rebuildAll] Auto-update enrichment failed (non-fatal):", e === null || e === void 0 ? void 0 : e.message);
+    }
     return { timelineChars: timelineContent.length, evidenceChars: evidenceContent.length };
 }

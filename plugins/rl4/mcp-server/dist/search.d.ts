@@ -12,7 +12,7 @@ export interface SearchChunk {
     line_end?: number;
     date?: string;
     excerpt: string;
-    /** Relevance: "high" | "medium" | "low" — based on normalized rerank score */
+    /** Relevance: "high" | "medium" | "low" — based on normalized term overlap score */
     relevance: "high" | "medium" | "low";
 }
 export declare function searchContext(root: string, query: string, filters?: SearchFilters): {

@@ -45,6 +45,77 @@ export interface FileLessons {
  * Used by suggest_edit to inject context before editing.
  */
 export declare function loadLessonsForFile(root: string, relPath: string): FileLessons;
+export interface FileHistoryReversal {
+    t: string;
+    added_sha: string;
+    removed_sha: string;
+    reverted_lines: number;
+    time_gap_hours: number;
+}
+export interface FileHistoryChatMention {
+    thread_title: string;
+    source: string;
+    date: string;
+}
+export interface RiskEpisode {
+    signal: string;
+    t: string;
+    score: number;
+    detail: string;
+}
+export interface ActivityEvent {
+    t: number;
+    linesAdded: number;
+    linesRemoved: number;
+}
+export interface IntentTransition {
+    t: number;
+    intent_signal: string;
+}
+export interface FileHistory {
+    versions_count: number;
+    first_seen: string;
+    last_modified: string;
+    reversals: FileHistoryReversal[];
+    chat_mentions: FileHistoryChatMention[];
+    dynamic_warnings: string[];
+    hot_score: number;
+    trajectory: string;
+    risk_score: number;
+    risk_episodes: RiskEpisode[];
+    lifetime_efficiency: number;
+}
+/**
+ * Universal Risk Model — 5-layer Laplace-smoothed risk scoring.
+ * Pure function, O(n), synchronous, ~2ms on typical input (~200 events).
+ * Based on Code Thrashing research (Nagappan & Ball 2005) + Lehman's Law.
+ */
+export declare function computeFileRisk(events: ActivityEvent[], transitions: IntentTransition[]): {
+    score: number;
+    episodes: RiskEpisode[];
+    lifetime_eff: number;
+};
+/**
+ * Read a ContentStore blob by SHA-256 checksum.
+ * Tries plain .content first, then .content.gz.
+ * Returns null if blob not found.
+ */
+export declare function readBlobSafe(root: string, sha256: string): string | null;
+/**
+ * Extract lines that were added in `addedBlob` but absent in `removedBlob`.
+ * These are the "reverted lines" — code that was written then undone.
+ * Filters out: short lines (<10 chars), pure syntax, whitespace-only.
+ */
+export declare function extractRevertedLines(addedBlob: string, removedBlob: string): string[];
+/**
+ * Reconstruct the full mechanical history of a file from RL4 evidence.
+ * PERF: Uses fast sources (intent_graph.json ~5ms, file_index.json ~2ms,
+ * intent_chains.jsonl ~20ms, chat_threads.jsonl ~5ms, activity.jsonl ~30ms with pre-filter).
+ * Total budget: ~64ms. Does NOT read chat_history.jsonl (31MB).
+ * Blob reading limited to last 3 reversals, only if hot_score > 0.5.
+ * Risk model: 5-layer Laplace-smoothed scoring from activity + intent transitions.
+ */
+export declare function reconstructFileHistory(root: string, relPath: string): FileHistory;
 export interface AgentAction {
     timestamp: string;
     tool: string;
@@ -82,6 +153,13 @@ export interface BurstSession {
     events_count: number;
     duration_ms: number;
 }
+export interface LineHunkData {
+    startOld: number;
+    countOld: number;
+    startNew: number;
+    countNew: number;
+    lines: string[];
+}
 export interface IntentGraphData {
     chains: Array<{
         file: string;
@@ -94,6 +172,10 @@ export interface IntentGraphData {
             to_v: number;
             reverted_lines: number;
             time_gap_hours: number;
+            thread_changed?: boolean;
+            hunks?: LineHunkData[];
+            suggestion_rejected?: boolean;
+            suggestion_hash?: string;
         } | null;
         causing_prompts: string[];
     }>;
@@ -129,3 +211,15 @@ export declare function formatDecisionsForResource(decisions: DecisionSummary[])
  * Used by the one-click snapshot to score and surface top CRE insights.
  */
 export declare function buildWorkspaceLessons(root: string): Lesson[];
+/**
+ * Rewrite absolute paths in remote context content to local equivalents.
+ * Called when a user reads another user's context via Supabase — the evidence
+ * and timeline contain absolute paths from the owner's machine.
+ *
+ * Detection: finds the first absolute path (/Users/X/... or /home/X/...) and
+ * infers the remote root from a `/.rl4/` boundary. If the remote root differs
+ * from localRoot, all occurrences are replaced.
+ *
+ * No-op when: no absolute paths, same root, or root can't be detected.
+ */
+export declare function rewriteRemotePaths(content: string, localRoot: string): string;

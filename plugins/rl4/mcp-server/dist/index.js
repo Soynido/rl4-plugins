@@ -8,7 +8,7 @@ var _a, _b, _c;
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { getWorkspaceRoot, getEvidencePath, readEvidence, readTimeline, readIntentGraph, readFileSafe, loadLessonsForFile, appendAgentAction, readCausalLinks, readBurstSessions, readIntentGraphData, computeAvgDaysBetweenSaves, loadCREState, } from "./workspace.js";
+import { getWorkspaceRoot, getEvidencePath, readEvidence, readTimeline, readIntentGraph, readFileSafe, loadLessonsForFile, appendAgentAction, readCausalLinks, readBurstSessions, readIntentGraphData, computeAvgDaysBetweenSaves, loadCREState, rewriteRemotePaths, } from "./workspace.js";
 import { rebuildAll, queryDateRange } from "./autoGenerate.js";
 import { buildCouplingGraph, scoreLessons, scoreLessonsAdapted, selectSubmodular, stableLessonId, switchDREstimate, CRE_PARAMS, } from "./causal_engine.js";
 import { logIntervention, resolveOutcomes, readAllInterventions } from "./cre_learner.js";
@@ -16,14 +16,22 @@ import { searchContext, formatPerplexityStyle, formatStructuredContent, formatSt
 import { ask } from "./ask.js";
 import { warmUpEngine } from "./rag.js";
 import { resolveUnderRoot } from "./safePath.js";
-import { buildCliSnapshot } from "./cliSnapshot.js";
+import { lockedAppend, lockedAppendAsync } from "./utils/fs_lock.js";
+import { rebuildIfStale } from "./intentGraphBuilder.js";
+import { buildCliSnapshot, scanCursorDb } from "./cliSnapshot.js";
+import { scanItemToChatMessage } from "./scanItemTransformer.js";
+import { discoverGitRepos, scanGitHistory } from "./gitScanner.js";
+import { scanOrphanWorkspaces, scanGlobalStorage } from "./deepMiner.js";
+import { startHttpServer, matchAvoidPatterns } from "./http_server.js";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import * as crypto from "crypto";
 import * as zlib from "zlib";
 import { execFile } from "child_process";
+let trustLedgerPath = ""; // Chain-of-Trust: set after root resolution
 const root = getWorkspaceRoot();
+trustLedgerPath = path.join(root, ".rl4", ".internal", "trust_ledger.json");
 // Diagnostic: log how root was resolved
 console.error(`[RL4 MCP] Root resolved: "${root}"`);
 console.error(`[RL4 MCP] RL4_WORKSPACE_ROOT env: "${(_a = process.env.RL4_WORKSPACE_ROOT) !== null && _a !== void 0 ? _a : '(not set)'}"`);
@@ -47,6 +55,94 @@ if (root) {
     else {
         console.error(`[RL4 MCP] Workspace NOT tracked (no .rl4/) — local tools read-only, use RL4: Connect to enable tracking: ${root}`);
     }
+}
+// ── Local workspace_id → path resolver ──────────────────────────────────────
+// Scans $HOME for .rl4/ dirs, hashes each path to build workspace_id → parent_path mapping.
+// This allows read_source_file to resolve local paths for "remote" workspaces that are actually on this machine.
+let localWorkspaceMap = null; // workspace_id → parent dir
+function computeWsId(rl4Dir) {
+    const normalized = path.normalize(path.resolve(rl4Dir)).replace(/\/$/, "");
+    return crypto.createHash("sha256").update(normalized).digest("hex").substring(0, 16);
+}
+function buildLocalWorkspaceMap() {
+    const map = new Map();
+    const homeDir = os.homedir();
+    // Scan up to 5 levels deep under $HOME for .rl4/ directories
+    const scanDir = (dir, depth) => {
+        if (depth > 5)
+            return;
+        try {
+            const entries = fs.readdirSync(dir, { withFileTypes: true });
+            for (const e of entries) {
+                if (e.name.startsWith(".") && e.name !== ".rl4")
+                    continue; // skip hidden dirs except .rl4
+                if (!e.isDirectory())
+                    continue;
+                const full = path.join(dir, e.name);
+                if (e.name === ".rl4") {
+                    const parentDir = dir;
+                    const wsId = computeWsId(full);
+                    map.set(wsId, parentDir);
+                }
+                else if (e.name !== "node_modules" && e.name !== ".git" && e.name !== ".next" && e.name !== "dist") {
+                    scanDir(full, depth + 1);
+                }
+            }
+        }
+        catch { /* permission denied, etc. */ }
+    };
+    scanDir(homeDir, 0);
+    console.error(`[RL4 MCP] Local workspace map: ${map.size} workspaces found`);
+    return map;
+}
+/** Resolve the local filesystem path for a workspace_id, or null if not on this machine. */
+function resolveLocalWorkspacePath(workspaceId) {
+    var _a;
+    if (!localWorkspaceMap)
+        localWorkspaceMap = buildLocalWorkspaceMap();
+    return (_a = localWorkspaceMap.get(workspaceId)) !== null && _a !== void 0 ? _a : null;
+}
+// ── Opportunistic CRE Outcome Resolution (async, throttled) ──────────────────
+//
+// Fire-and-forget: runs in the background so MCP tool responses are never blocked.
+// Throttled: max once per 60s to avoid redundant lock contention on the JSONL.
+// Processes ALL pending interventions (no files filter).
+const CRE_RESOLVE_COOLDOWN_MS = 60000; // 60s between resolution sweeps
+let lastResolveTimestamp = 0;
+let resolveInFlight = false;
+// Chain-of-Trust: shared file ledger for cross-process trust
+// All MCP processes write to the same file; the HTTP endpoint (whoever owns :17340) reads it.
+// Uses atomic tmp+rename (POSIX) — no lock needed for a single-value timestamp.
+function updateTrustLedger() {
+    if (!trustLedgerPath)
+        return;
+    try {
+        const tmp = `${trustLedgerPath}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, JSON.stringify({ t: Date.now(), pid: process.pid }));
+        fs.renameSync(tmp, trustLedgerPath);
+    }
+    catch { /* non-blocking — trust ledger is best-effort */ }
+}
+function opportunisticResolveOutcomes() {
+    const now = Date.now();
+    if (resolveInFlight)
+        return; // already running
+    if (now - lastResolveTimestamp < CRE_RESOLVE_COOLDOWN_MS)
+        return; // throttled
+    resolveInFlight = true;
+    lastResolveTimestamp = now;
+    // Run on next tick so the MCP response returns immediately
+    setImmediate(() => {
+        try {
+            resolveOutcomes(root); // no files filter = ALL pending
+        }
+        catch (e) {
+            console.error("[RL4 MCP] Opportunistic CRE resolve failed:", e);
+        }
+        finally {
+            resolveInFlight = false;
+        }
+    });
 }
 const TRIGGER_HEADLESS = ".trigger_headless_snapshot";
 const HEADLESS_RESULT = ".headless_result.json";
@@ -372,9 +468,16 @@ async function fetchWorkspaceContextFromSupabase(workspaceId) {
         const intentGraphText = intentGraphJson != null && typeof intentGraphJson === "object"
             ? `Source: Supabase rl4_workspace_intent_graph (workspace ${workspaceId})\n\n${JSON.stringify(intentGraphJson, null, 2)}`
             : `[No intent_graph for this workspace in Supabase. Sync from extension (snapshot/startup).]`;
+        // Rewrite remote absolute paths to local equivalents (if root is known)
+        const evidenceOut = evidenceMd
+            ? rewriteRemotePaths(`Source: Supabase rl4_workspace_evidence (workspace ${workspaceId})\n\n${evidenceMd}`, root)
+            : `[No evidence for this workspace in Supabase. Sync from extension (snapshot/startup).]`;
+        const timelineOut = timelineMd
+            ? rewriteRemotePaths(`Source: Supabase rl4_workspace_timeline (workspace ${workspaceId})\n\n${timelineMd}`, root)
+            : `[No timeline for this workspace in Supabase. Sync from extension (snapshot/startup).]`;
         return {
-            evidence: evidenceMd ? `Source: Supabase rl4_workspace_evidence (workspace ${workspaceId})\n\n${evidenceMd}` : `[No evidence for this workspace in Supabase. Sync from extension (snapshot/startup).]`,
-            timeline: timelineMd ? `Source: Supabase rl4_workspace_timeline (workspace ${workspaceId})\n\n${timelineMd}` : `[No timeline for this workspace in Supabase. Sync from extension (snapshot/startup).]`,
+            evidence: evidenceOut,
+            timeline: timelineOut,
             decisions: decisionsText,
             intent_graph: intentGraphText,
         };
@@ -439,6 +542,7 @@ mcpServer.resource("intent_graph", "rl4://workspace/intent_graph", { description
 mcpServer.tool("get_evidence", "Get project evidence — mechanical facts, work sessions, file activity, and development patterns. Use when the user asks about what happened in the project, recent activity, work sessions, or factual project history. Returns structured, cited sections.", {}, async () => {
     const { id: toId, name: toName } = getCurrentWorkspaceIdAndName();
     logContextReference({ to_workspace_id: toId, to_workspace_name: toName, action: "get_evidence" });
+    updateTrustLedger(); // Chain-of-Trust shared file ledger
     if (isRemoteWorkspace() && selectedWorkspaceId) {
         const raw = await fetchEvidenceFromSupabase(selectedWorkspaceId);
         const text = formatStructuredContent("project evidence", raw, `Supabase workspace ${selectedWorkspaceId}`, "This is the project evidence — mechanical facts about development activity. Use these sections to answer questions about what happened, when sessions occurred, which files were modified, and overall project patterns.");
@@ -455,6 +559,7 @@ mcpServer.tool("get_timeline", "Get the development timeline. Without date param
 }, async ({ date_from, date_to }) => {
     const { id: toId, name: toName } = getCurrentWorkspaceIdAndName();
     logContextReference({ to_workspace_id: toId, to_workspace_name: toName, action: "get_timeline" });
+    updateTrustLedger(); // Chain-of-Trust shared file ledger
     // Rich date-range query mode — live JSONL query
     if (date_from && date_to) {
         if (isRemoteWorkspace() && selectedWorkspaceId) {
@@ -480,13 +585,30 @@ mcpServer.tool("get_timeline", "Get the development timeline. Without date param
 // get_decisions removed — low-quality output (timeline regex parse with hardcoded confidence).
 // Decisions are better served by search_context(source:"timeline") or rl4_ask.
 mcpServer.tool("get_intent_graph", "Get the intent graph — maps which files are edited together, hot areas of the codebase, development workflow patterns, and activity chains. Use when the user asks about codebase structure, most active files, common editing patterns, or development workflows. Returns structured sections.", {}, async () => {
+    updateTrustLedger(); // Chain-of-Trust shared file ledger
+    // Opportunistic CRE outcome resolution (async, non-blocking)
+    opportunisticResolveOutcomes();
+    // Rebuild intent_graph.json if stale (new events since last build)
+    try {
+        rebuildIfStale(root);
+    }
+    catch { /* non-critical */ }
     if (isRemoteWorkspace() && selectedWorkspaceId) {
         const raw = await fetchIntentGraphFromSupabase(selectedWorkspaceId);
         const text = formatStructuredIntentGraph(raw, `Supabase workspace ${selectedWorkspaceId}`);
         return { content: [{ type: "text", text }] };
     }
     const raw = readIntentGraph(root);
-    const text = formatStructuredIntentGraph(raw, ".rl4/intent_graph.json");
+    const graphData = readIntentGraphData(root);
+    let staleness = '';
+    if (graphData === null || graphData === void 0 ? void 0 : graphData.built_at) {
+        const ageMs = Date.now() - new Date(graphData.built_at).getTime();
+        const ageMins = Math.round(ageMs / 60000);
+        if (ageMins > 5) {
+            staleness = `\n\n⚠️ **Stale graph** — built ${ageMins}min ago (${graphData.built_at}). Suggestion attribution may be missing. Trigger a scan (rl4.scan) or extension reload to rebuild.`;
+        }
+    }
+    const text = formatStructuredIntentGraph(raw, ".rl4/intent_graph.json") + staleness;
     return { content: [{ type: "text", text }] };
 });
 // --- RL4 Connect: list workspaces (Supabase), set workspace ---
@@ -636,7 +758,10 @@ mcpServer.tool("list_workspaces", "List workspaces for the current user (from Su
             ? `**Your workspaces:**\n${workspaces.map((w) => { var _a; return `${++idx}. ${w.workspace_name} (id: ${w.workspace_id}, snapshots: ${(_a = w.snapshot_count) !== null && _a !== void 0 ? _a : 0})`; }).join("\n")}`
             : "";
         const sharedLines = sharedWorkspaces.length > 0
-            ? `\n\n**Shared with you** (read-only):\n${sharedWorkspaces.map((w) => `${++idx}. ${w.workspace_name} (id: ${w.workspace_id}, shared by: ${w.owner_email})`).join("\n")}`
+            ? `\n\n**Shared with you** (read-only):\n${sharedWorkspaces.map((w) => {
+                const warn = w.repo_access_warning ? ` ⚠ ${w.repo_access_warning}` : '';
+                return `${++idx}. ${w.workspace_name} (id: ${w.workspace_id}, shared by: ${w.owner_email}${warn})`;
+            }).join("\n")}`
             : "";
         const teamLines = uniqueTeamWorkspaces.length > 0
             ? `\n\n**Team — same repo** (read-only, auto-discovered):\n${uniqueTeamWorkspaces.map((w) => `${++idx}. ${w.workspace_name} (id: ${w.workspace_id}, by: ${w.owner_email}, repo: ${w.repo_id})`).join("\n")}`
@@ -789,9 +914,16 @@ mcpServer.tool("search_context", "Search across all project context — code, ev
     const { query, source, tag, file, date_from, date_to, limit } = parsed.data;
     const { id: toId, name: toName } = getCurrentWorkspaceIdAndName();
     logContextReference({ to_workspace_id: toId, to_workspace_name: toName, action: "search_context", query_text: query });
+    updateTrustLedger(); // Chain-of-Trust shared file ledger
+    // Opportunistic CRE outcome resolution (async, non-blocking)
+    opportunisticResolveOutcomes();
     if (isRemoteWorkspace() && selectedWorkspaceId) {
         const text = await searchContextFromSupabase(selectedWorkspaceId, query, limit !== null && limit !== void 0 ? limit : 10);
-        return { content: [{ type: "text", text }] };
+        const localPath = resolveLocalWorkspacePath(selectedWorkspaceId);
+        const hint = localPath
+            ? `\n\n💡 **Tip**: For actual source code content (file text, headings, UI labels), use \`read_source_file\` — it auto-resolves this workspace to \`${localPath}\`.`
+            : `\n\n💡 **Tip**: For actual source code content, the repo must be cloned locally. Use \`read_source_file\` after cloning.`;
+        return { content: [{ type: "text", text: text + hint }] };
     }
     const filters = { source, tag, file, date_from, date_to, limit };
     const result = searchContext(root, query, filters);
@@ -820,10 +952,17 @@ mcpServer.tool("rl4_ask", "Ask ANY question about this project — how the code 
     }
     const { id: toId, name: toName } = getCurrentWorkspaceIdAndName();
     logContextReference({ to_workspace_id: toId, to_workspace_name: toName, action: "rl4_ask", query_text: parsed.data.query });
+    updateTrustLedger(); // Chain-of-Trust shared file ledger
+    // Opportunistic CRE outcome resolution (async, non-blocking)
+    opportunisticResolveOutcomes();
     if (isRemoteWorkspace() && selectedWorkspaceId) {
         const { query } = parsed.data;
         const text = await searchContextFromSupabase(selectedWorkspaceId, query, (_a = parsed.data.limit) !== null && _a !== void 0 ? _a : 5);
-        return { content: [{ type: "text", text: `**rl4_ask (remote workspace — in-memory search)**\n\n${text}` }] };
+        const localPath = resolveLocalWorkspacePath(selectedWorkspaceId);
+        const hint = localPath
+            ? `\n\n💡 **Tip**: This search only covers evidence/metadata. For actual source code (file content, UI text, implementation), use \`read_source_file({ path: "..." })\` — this workspace resolves to \`${localPath}\` on this machine.`
+            : `\n\n💡 **Tip**: This search only covers evidence/metadata. Clone the repo locally and use \`read_source_file\` for actual source code content.`;
+        return { content: [{ type: "text", text: `**rl4_ask (remote workspace — in-memory search)**\n\n${text}${hint}` }] };
     }
     const { query, source, tag, date_from, date_to, limit } = parsed.data;
     const options = { source, tag, date_from, date_to, limit };
@@ -1089,6 +1228,286 @@ mcpServer.tool("finalize_snapshot", "Call this after you have used the snapshot 
         return { content: [{ type: "text", text: `finalize_snapshot failed: ${msg}` }], isError: true };
     }
 });
+// ── backfill_chat_history — Manual escape hatch to ingest ALL chat history ──
+mcpServer.tool("backfill_chat_history", "Scan Cursor SQLite DB with NO LIMIT to capture full chat history (including pre-existing messages from before RL4 was installed). Deduplicates against existing chat_history.jsonl, appends only new messages in canonical format, then rebuilds timeline.md + evidence.md. Use when chat evidence is incomplete or missing old messages.", {}, async () => {
+    if (isRemoteWorkspace()) {
+        return {
+            content: [{ type: "text", text: "backfill_chat_history only works for workspace 'current'." }],
+            isError: true,
+        };
+    }
+    try {
+        const chatHistPath = resolveUnderRoot(root, ".rl4", "evidence", "chat_history.jsonl");
+        // 0. MIGRATION: Convert old-format messages (textDescription/unixMs) to canonical format
+        let migratedCount = 0;
+        try {
+            if (fs.existsSync(chatHistPath)) {
+                const rawLines = fs.readFileSync(chatHistPath, "utf8").split("\n").filter(Boolean);
+                const migrated = [];
+                let needsMigration = false;
+                for (const line of rawLines) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.textDescription && !obj.content) {
+                            // Old format → transform to canonical
+                            const canonical = scanItemToChatMessage({
+                                generationUUID: obj.generationUUID || obj.id,
+                                unixMs: obj.unixMs || obj.unix_ms || Date.now(),
+                                type: obj.type || obj.role,
+                                textDescription: obj.textDescription,
+                                provider: obj.provider,
+                                transcript_ref: obj.transcript_ref || obj.thread_id,
+                            });
+                            migrated.push(JSON.stringify(canonical));
+                            needsMigration = true;
+                            migratedCount++;
+                        }
+                        else {
+                            migrated.push(line); // Already in canonical format
+                        }
+                    }
+                    catch {
+                        migrated.push(line); // Keep malformed lines as-is
+                    }
+                }
+                if (needsMigration) {
+                    // Atomic rewrite: tmp + rename
+                    const tmpPath = chatHistPath + '.migration.tmp';
+                    fs.writeFileSync(tmpPath, migrated.join("\n") + "\n");
+                    fs.renameSync(tmpPath, chatHistPath);
+                }
+            }
+        }
+        catch (migErr) {
+            console.error('[backfill] Migration step failed (non-fatal):', migErr);
+        }
+        // 1. Scan with LIMIT 0 = no limit (full history)
+        const scanResult = await scanCursorDb(root, 0);
+        if (scanResult.items.length === 0 && migratedCount === 0) {
+            return { content: [{ type: "text", text: "No chat messages found in Cursor DB." }] };
+        }
+        // 2. Read existing IDs for dedup (re-read after migration)
+        const existingIds = new Set();
+        try {
+            if (fs.existsSync(chatHistPath)) {
+                const lines = fs.readFileSync(chatHistPath, "utf8").split("\n").filter(Boolean);
+                for (const line of lines) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.id)
+                            existingIds.add(obj.id);
+                    }
+                    catch { /* skip malformed */ }
+                }
+            }
+        }
+        catch { /* ignore read errors */ }
+        // 3. Transform + dedup
+        const newMessages = scanResult.items
+            .map((item) => scanItemToChatMessage(item))
+            .filter((m) => !existingIds.has(m.id));
+        if (newMessages.length === 0) {
+            const migMsg = migratedCount > 0 ? ` Migrated ${migratedCount} old-format messages to canonical format.` : '';
+            return {
+                content: [{
+                        type: "text",
+                        text: `All ${scanResult.items.length} messages already in chat_history.jsonl. No backfill needed.${migMsg}`,
+                    }],
+            };
+        }
+        // 4. Append via lockedAppendAsync (5 retries) — NOT overwrite
+        const chatLines = newMessages.map((m) => JSON.stringify(m)).join("\n") + "\n";
+        await lockedAppendAsync(chatHistPath, chatLines);
+        // 5. Rebuild timeline.md + evidence.md
+        rebuildAll(root);
+        const migMsg = migratedCount > 0 ? ` Migrated ${migratedCount} old-format messages.` : '';
+        return {
+            content: [{
+                    type: "text",
+                    text: `Backfill complete: ${newMessages.length} new messages appended (${existingIds.size + newMessages.length} total).${migMsg} timeline.md + evidence.md rebuilt.`,
+                }],
+        };
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `backfill_chat_history failed: ${msg}` }], isError: true };
+    }
+});
+// ── ingest_git_history — Git-to-Evidence bridge ──
+mcpServer.tool("ingest_git_history", "Ingest git commit history from workspace repos into RL4 evidence. Transforms commits into activity events (with line counts for Hot Score) and chat messages ('Ghost Prompts' — commit messages as retroactive intent). Auto-discovers sub-repos.", {
+    repo_path: z.string().optional().describe("Specific repo path (default: workspace root)"),
+    since: z.string().optional().describe("Only ingest commits after this ISO date"),
+    scan_subrepos: z.boolean().optional().default(true).describe("Auto-discover sub-repos"),
+}, async (args) => {
+    try {
+        const workspaceRoot = args.repo_path || root;
+        // 1. Discover repos
+        const repos = args.scan_subrepos
+            ? discoverGitRepos(workspaceRoot)
+            : [workspaceRoot];
+        if (repos.length === 0) {
+            return { content: [{ type: "text", text: "No git repositories found." }] };
+        }
+        // 2. Scan all repos
+        const allActivities = [];
+        const allChatMessages = [];
+        let totalCommits = 0;
+        const repoStats = [];
+        for (const repoPath of repos) {
+            const result = scanGitHistory(repoPath, args.since);
+            allActivities.push(...result.activities);
+            allChatMessages.push(...result.chatMessages);
+            totalCommits += result.commits.length;
+            if (result.commits.length > 0) {
+                const first = result.commits[0];
+                const last = result.commits[result.commits.length - 1];
+                repoStats.push(`${path.basename(repoPath)}: ${result.commits.length} commits (${first.date.slice(0, 10)} → ${last.date.slice(0, 10)})`);
+            }
+        }
+        if (totalCommits === 0) {
+            return { content: [{ type: "text", text: `Scanned ${repos.length} repos, no commits found.` }] };
+        }
+        // 3. Dedup against existing data
+        const activityPath = resolveUnderRoot(root, ".rl4", "evidence", "activity.jsonl");
+        const chatHistPath = resolveUnderRoot(root, ".rl4", "evidence", "chat_history.jsonl");
+        const existingActivityKeys = new Set();
+        const existingChatIds = new Set();
+        try {
+            if (fs.existsSync(activityPath)) {
+                for (const line of fs.readFileSync(activityPath, "utf8").split("\n").filter(Boolean)) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.commit_hash && obj.file)
+                            existingActivityKeys.add(`${obj.commit_hash}:${obj.file}`);
+                    }
+                    catch { /* skip */ }
+                }
+            }
+        }
+        catch { /* ignore */ }
+        try {
+            if (fs.existsSync(chatHistPath)) {
+                for (const line of fs.readFileSync(chatHistPath, "utf8").split("\n").filter(Boolean)) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.id)
+                            existingChatIds.add(obj.id);
+                    }
+                    catch { /* skip */ }
+                }
+            }
+        }
+        catch { /* ignore */ }
+        const newActivities = allActivities.filter(a => !existingActivityKeys.has(`${a.commit_hash}:${a.file}`));
+        const newChatMessages = allChatMessages.filter(m => !existingChatIds.has(m.id));
+        // 4. Write via lockedAppendAsync (SWA: we're in the MCP daemon process)
+        if (newActivities.length > 0) {
+            const lines = newActivities.map(a => JSON.stringify(a)).join("\n") + "\n";
+            await lockedAppendAsync(activityPath, lines);
+        }
+        if (newChatMessages.length > 0) {
+            const lines = newChatMessages.map(m => JSON.stringify(m)).join("\n") + "\n";
+            await lockedAppendAsync(chatHistPath, lines);
+        }
+        // 5. Rebuild timeline.md + evidence.md
+        if (newActivities.length > 0 || newChatMessages.length > 0) {
+            rebuildAll(root);
+        }
+        const summary = [
+            `Git ingestion complete:`,
+            `- Repos scanned: ${repos.length}`,
+            `- Total commits: ${totalCommits}`,
+            `- New activities: ${newActivities.length} (${allActivities.length - newActivities.length} deduped)`,
+            `- New chat messages: ${newChatMessages.length} (${allChatMessages.length - newChatMessages.length} deduped)`,
+            ``,
+            ...repoStats,
+        ].join("\n");
+        return { content: [{ type: "text", text: summary }] };
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `ingest_git_history failed: ${msg}` }], isError: true };
+    }
+});
+// ── deep_recover — Forensic SQLite recovery from ALL Cursor workspaces ──
+mcpServer.tool("deep_recover", "Recover orphan chat history from ALL Cursor workspaces + globalStorage. Uses 3-level Unique Intent Identifiers to find messages related to the current project, even from old/renamed workspaces. Deduplicates, appends to chat_history.jsonl, rebuilds evidence.", {
+    keywords: z.array(z.string()).optional().default(["rl4", "snapshot", "RCEP"]).describe("Keywords to boost relevance matching"),
+    include_all_workspaces: z.boolean().optional().default(false).describe("Include ALL workspaces regardless of match score"),
+    scan_global: z.boolean().optional().default(true).describe("Also scan globalStorage for composer data"),
+}, async (args) => {
+    try {
+        // 1. Scan orphan workspaces
+        const { orphans, messages: wsMessages, scannedCount } = await scanOrphanWorkspaces(args.keywords, args.include_all_workspaces);
+        // 2. Scan globalStorage
+        let globalMessages = [];
+        let globalComposers = 0;
+        if (args.scan_global) {
+            const globalResult = await scanGlobalStorage(args.keywords);
+            globalMessages = globalResult.messages;
+            globalComposers = globalResult.composerCount;
+        }
+        const allRecovered = [...wsMessages, ...globalMessages];
+        if (allRecovered.length === 0) {
+            return {
+                content: [{
+                        type: "text",
+                        text: `Scanned ${scannedCount} workspaces + globalStorage. No relevant orphan messages found.`,
+                    }],
+            };
+        }
+        // 3. Dedup against existing chat_history.jsonl
+        const chatHistPath = resolveUnderRoot(root, ".rl4", "evidence", "chat_history.jsonl");
+        const existingIds = new Set();
+        try {
+            if (fs.existsSync(chatHistPath)) {
+                for (const line of fs.readFileSync(chatHistPath, "utf8").split("\n").filter(Boolean)) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.id)
+                            existingIds.add(obj.id);
+                    }
+                    catch { /* skip */ }
+                }
+            }
+        }
+        catch { /* ignore */ }
+        const newMessages = allRecovered.filter(m => !existingIds.has(m.id));
+        if (newMessages.length === 0) {
+            return {
+                content: [{
+                        type: "text",
+                        text: `Found ${allRecovered.length} messages across ${orphans.length} orphan workspaces, but all already exist in chat_history.jsonl.`,
+                    }],
+            };
+        }
+        // 4. Append new messages
+        const lines = newMessages.map(m => JSON.stringify(m)).join("\n") + "\n";
+        await lockedAppendAsync(chatHistPath, lines);
+        // 5. Rebuild
+        rebuildAll(root);
+        // 6. Summary
+        const orphanList = orphans
+            .sort((a, b) => b.matchScore - a.matchScore)
+            .map(o => `  ${o.folder} — ${o.messageCount} msgs, score: ${o.matchScore.toFixed(2)}, ${o.dateRange.from.slice(0, 10)} → ${o.dateRange.to.slice(0, 10)}`)
+            .join("\n");
+        const summary = [
+            `Deep recovery complete:`,
+            `- Workspaces scanned: ${scannedCount}`,
+            `- Orphan workspaces matched: ${orphans.length}`,
+            `- Global composers matched: ${globalComposers}`,
+            `- Messages recovered: ${newMessages.length} new (${allRecovered.length - newMessages.length} deduped)`,
+            `- Total in chat_history.jsonl: ${existingIds.size + newMessages.length}`,
+            ``,
+            `Matched workspaces:`,
+            orphanList || "  (none)",
+        ].join("\n");
+        return { content: [{ type: "text", text: summary }] };
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `deep_recover failed: ${msg}` }], isError: true };
+    }
+});
 const FILE_INDEX_PATH = ".rl4/snapshots/file_index.json";
 const SNAPSHOTS_DIR = ".rl4/snapshots";
 const SHA256_HEX = /^[a-f0-9]{64}$/;
@@ -1143,6 +1562,227 @@ mcpServer.tool("read_rl4_blob", "Read the content of a ContentStore blob by SHA-
     catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         return { content: [{ type: "text", text: `read_rl4_blob failed: ${msg}` }], isError: true };
+    }
+});
+// ── restore_version — restore a file to a previous ContentStore version ──
+mcpServer.tool("restore_version", "Restore a file to a previous version using a ContentStore blob. Use get_content_store_index to find checksums for a file, then call this to restore. Backs up current version, writes restored content, logs IntentEvent. Only works for workspace 'current'.", {
+    file: z.string().describe("Relative file path from workspace root, e.g. 'media/styles.css'"),
+    checksum: z.string().describe("SHA-256 checksum (64 lowercase hex chars) of the version to restore"),
+    reason: z.string().optional().describe("Why this restore is needed (logged for audit trail)"),
+}, async (args) => {
+    var _a, _b, _c;
+    if (isRemoteWorkspace()) {
+        return { content: [{ type: "text", text: "restore_version only works for workspace 'current'." }] };
+    }
+    const relPath = String((_a = args.file) !== null && _a !== void 0 ? _a : "").trim();
+    const checksum = String((_b = args.checksum) !== null && _b !== void 0 ? _b : "").trim().toLowerCase();
+    const reason = String((_c = args.reason) !== null && _c !== void 0 ? _c : "manual restore");
+    if (!relPath) {
+        return { content: [{ type: "text", text: "restore_version: file path is required." }], isError: true };
+    }
+    if (!SHA256_HEX.test(checksum)) {
+        return { content: [{ type: "text", text: "restore_version: checksum must be 64 lowercase hex characters (SHA-256)." }], isError: true };
+    }
+    // Read the blob to restore
+    const blobPath = resolveUnderRoot(root, ".rl4", "snapshots", `${checksum}.content`);
+    const blobPathGz = resolveUnderRoot(root, ".rl4", "snapshots", `${checksum}.content.gz`);
+    let restoredContent;
+    try {
+        if (fs.existsSync(blobPath)) {
+            restoredContent = fs.readFileSync(blobPath, "utf8");
+        }
+        else if (fs.existsSync(blobPathGz)) {
+            const compressed = fs.readFileSync(blobPathGz);
+            restoredContent = zlib.gunzipSync(compressed).toString("utf-8");
+        }
+        else {
+            return { content: [{ type: "text", text: `restore_version: No blob found for checksum ${checksum}.` }], isError: true };
+        }
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `restore_version: Failed to read blob: ${msg}` }], isError: true };
+    }
+    // Resolve target file path (safety: must be under workspace root)
+    const targetPath = resolveUnderRoot(root, relPath);
+    // Backup current file if it exists
+    let backupChecksum = null;
+    let currentLines = 0;
+    try {
+        if (fs.existsSync(targetPath)) {
+            const currentContent = fs.readFileSync(targetPath, "utf8");
+            currentLines = currentContent.split("\n").length;
+            backupChecksum = crypto.createHash("sha256").update(currentContent).digest("hex");
+            // Store backup blob if not already stored
+            const backupBlobPath = resolveUnderRoot(root, ".rl4", "snapshots", `${backupChecksum}.content`);
+            if (!fs.existsSync(backupBlobPath)) {
+                fs.writeFileSync(backupBlobPath, currentContent);
+            }
+        }
+    }
+    catch { /* non-critical — proceed with restore */ }
+    // Write restored content
+    try {
+        const dir = path.dirname(targetPath);
+        if (!fs.existsSync(dir))
+            fs.mkdirSync(dir, { recursive: true });
+        fs.writeFileSync(targetPath, restoredContent);
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `restore_version: Failed to write file: ${msg}` }], isError: true };
+    }
+    // Log IntentEvent
+    const restoredLines = restoredContent.split("\n").length;
+    try {
+        const intentEvent = {
+            t: new Date().toISOString(),
+            file: relPath,
+            from_sha256: backupChecksum,
+            to_sha256: checksum,
+            delta: {
+                linesAdded: restoredLines,
+                linesRemoved: currentLines,
+                netChange: restoredLines - currentLines,
+            },
+            intent_signal: "restore_version",
+            causing_prompt: reason,
+            burst_id: null,
+            persisted_at: new Date().toISOString(),
+        };
+        const chainsPath = resolveUnderRoot(root, ".rl4", "evidence", "intent_chains.jsonl");
+        lockedAppend(chainsPath, JSON.stringify(intentEvent));
+        const activityEvent = {
+            t: intentEvent.t,
+            kind: "save",
+            path: relPath,
+            sha256: checksum,
+            linesAdded: restoredLines,
+            linesRemoved: currentLines,
+            source: "restore_version",
+        };
+        const activityPath = resolveUnderRoot(root, ".rl4", "evidence", "activity.jsonl");
+        lockedAppend(activityPath, JSON.stringify(activityEvent));
+    }
+    catch { /* non-critical */ }
+    const summary = [
+        `✅ Restored ${relPath} to version ${checksum.slice(0, 12)}...`,
+        backupChecksum ? `📦 Backup saved: ${backupChecksum.slice(0, 12)}...` : "📦 No previous version (new file)",
+        `📊 ${restoredLines} lines (was ${currentLines})`,
+        `📝 Reason: ${reason}`,
+    ].join("\n");
+    return { content: [{ type: "text", text: summary }] };
+});
+// ── audit_refactor — check files against AVOID patterns ──
+mcpServer.tool("audit_refactor", "Audit files against RL4 AVOID patterns after a refactor. For each file, loads current content and checks against known avoid_patterns + reports hot_score and reversals. Max 20 files per call. Only works for workspace 'current'.", {
+    files: z.array(z.string()).describe("List of relative file paths to audit, e.g. ['media/styles.css', 'src/extension.ts']"),
+}, async (args) => {
+    var _a;
+    if (isRemoteWorkspace()) {
+        return { content: [{ type: "text", text: "audit_refactor only works for workspace 'current'." }] };
+    }
+    const files = ((_a = args.files) !== null && _a !== void 0 ? _a : []).slice(0, 20);
+    if (files.length === 0) {
+        return { content: [{ type: "text", text: "audit_refactor: at least one file path is required." }], isError: true };
+    }
+    const results = [`[RL4 AUDIT — ${files.length} file(s) checked]`];
+    let totalViolations = 0;
+    for (const relPath of files) {
+        try {
+            const fl = loadLessonsForFile(root, relPath);
+            const targetPath = resolveUnderRoot(root, relPath);
+            let violations = [];
+            if (fl.avoid_patterns.length > 0 && fs.existsSync(targetPath)) {
+                const content = fs.readFileSync(targetPath, "utf8");
+                violations = matchAvoidPatterns(content, fl.avoid_patterns);
+            }
+            totalViolations += violations.length;
+            if (violations.length > 0) {
+                results.push(`⛔ ${relPath} — ${violations.length} violation(s):`);
+                for (const v of violations) {
+                    results.push(`   VIOLATED: "${v}"`);
+                }
+            }
+            else {
+                results.push(`✅ ${relPath} — 0 violations`);
+            }
+            // Add context info
+            const meta = [];
+            if (fl.hot_score > 0.3)
+                meta.push(`hot_score: ${fl.hot_score.toFixed(2)}`);
+            if (fl.reversals.length > 0)
+                meta.push(`${fl.reversals.length} reversal(s)`);
+            if (fl.coupled_files.length > 0)
+                meta.push(`coupled: ${fl.coupled_files.slice(0, 3).join(", ")}`);
+            if (meta.length > 0) {
+                results.push(`   ℹ️ ${meta.join(" | ")}`);
+            }
+        }
+        catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            results.push(`⚠️ ${relPath} — error: ${msg}`);
+        }
+    }
+    results.push(`\n📊 Summary: ${totalViolations} total violation(s) across ${files.length} file(s)`);
+    return { content: [{ type: "text", text: results.join("\n") }] };
+});
+// ── read_source_file — read any source file from the workspace ──
+const READ_SOURCE_MAX_BYTES = 512 * 1024; // 512 KB safety cap
+mcpServer.tool("read_source_file", "Read a source file by relative path. Returns raw text content of any file (code, markdown, config, etc.). Use this when search_context gives metadata but you need actual file content (headings, button text, implementation). Works for the current workspace AND for any other workspace on this machine (auto-resolves workspace_id → local path). Path is relative to workspace root. Max 512 KB.", {
+    path: z.string().describe("Relative file path from workspace root, e.g. 'src/app.js' or 'README.md'"),
+    line_start: z.number().optional().describe("Optional: first line to return (1-based). Omit for full file."),
+    line_end: z.number().optional().describe("Optional: last line to return (1-based, inclusive). Omit for full file."),
+}, async (args) => {
+    var _a;
+    // Resolve effective root: for remote workspaces, try to find local path on this machine
+    let effectiveRoot = root;
+    if (isRemoteWorkspace() && selectedWorkspaceId) {
+        const localPath = resolveLocalWorkspacePath(selectedWorkspaceId);
+        if (localPath) {
+            effectiveRoot = localPath;
+        }
+        else {
+            return {
+                content: [{ type: "text", text: `[Workspace ${selectedWorkspaceId} not found on this machine. read_source_file requires the repo to be cloned locally. Use search_context for remote evidence.]` }],
+            };
+        }
+    }
+    const filePath = String((_a = args.path) !== null && _a !== void 0 ? _a : "").trim();
+    if (!filePath) {
+        return { content: [{ type: "text", text: "read_source_file: path is required." }], isError: true };
+    }
+    try {
+        const resolved = resolveUnderRoot(effectiveRoot, filePath);
+        if (!fs.existsSync(resolved)) {
+            return { content: [{ type: "text", text: `[File not found: ${filePath} in ${effectiveRoot}]` }] };
+        }
+        const stat = fs.statSync(resolved);
+        if (stat.isDirectory()) {
+            // List directory contents instead
+            const entries = fs.readdirSync(resolved, { withFileTypes: true });
+            const listing = entries.map(e => `${e.isDirectory() ? "📁" : "📄"} ${e.name}`).join("\n");
+            return { content: [{ type: "text", text: `Directory listing for ${filePath}/:\n${listing}` }] };
+        }
+        if (stat.size > READ_SOURCE_MAX_BYTES) {
+            return {
+                content: [{ type: "text", text: `[File too large: ${(stat.size / 1024).toFixed(0)} KB > 512 KB limit. Use line_start/line_end to read a portion.]` }],
+            };
+        }
+        const raw = fs.readFileSync(resolved, "utf8");
+        const lineStart = args.line_start;
+        const lineEnd = args.line_end;
+        if (lineStart || lineEnd) {
+            const lines = raw.split("\n");
+            const start = Math.max(1, lineStart !== null && lineStart !== void 0 ? lineStart : 1) - 1;
+            const end = Math.min(lines.length, lineEnd !== null && lineEnd !== void 0 ? lineEnd : lines.length);
+            const slice = lines.slice(start, end);
+            return { content: [{ type: "text", text: slice.map((l, i) => `${start + i + 1}\t${l}`).join("\n") }] };
+        }
+        return { content: [{ type: "text", text: raw }] };
+    }
+    catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        return { content: [{ type: "text", text: `read_source_file failed: ${msg}` }], isError: true };
     }
 });
 // ── Fix #4: rl4_guardrail — validate query or response (proof-backed answers) ──
@@ -1668,7 +2308,7 @@ mcpServer.tool("apply_edit", "Write file content with SHA-256 backup and proof c
     content: z.string().describe("New file content to write"),
     description: z.string().describe("Short description of the change"),
 }, async (args) => {
-    var _a, _b, _c;
+    var _a, _b, _c, _d;
     if (isRemoteWorkspace()) {
         return { content: [{ type: "text", text: "apply_edit only works for workspace 'current'." }] };
     }
@@ -1682,6 +2322,27 @@ mcpServer.tool("apply_edit", "Write file content with SHA-256 backup and proof c
         return { content: [{ type: "text", text: "apply_edit: file_path and content are required." }], isError: true };
     }
     const absPath = resolveUnderRoot(root, relPath);
+    // ── CRE GATEKEEPER — ALLOW / REQUIRE / DENY ──
+    const enforcement = (_d = process.env.RL4_CRE_ENFORCEMENT) !== null && _d !== void 0 ? _d : "soft";
+    let cachedSuggestion = null;
+    try {
+        const cachePath = resolveUnderRoot(root, ".rl4", ".internal", "cre_last_suggestion.json");
+        const raw = fs.readFileSync(cachePath, "utf-8");
+        const parsed = JSON.parse(raw);
+        const cacheAgeMs = Date.now() - new Date(parsed.timestamp).getTime();
+        if (cacheAgeMs <= 30000 && parsed.file === relPath) {
+            cachedSuggestion = parsed;
+        }
+    }
+    catch { /* no cache or parse error — treated as "no suggest_edit called" */ }
+    // DENY: no suggest_edit was called (hard mode only)
+    if (!cachedSuggestion && enforcement === "hard") {
+        return { content: [{ type: "text", text: `DENY: suggest_edit was not called for "${relPath}". Call suggest_edit first to get CRE lessons, then retry apply_edit.` }], isError: true };
+    }
+    // WARN: AVOID patterns are returned as warnings in the response (REQUIRE state).
+    // We do NOT DENY on AVOID patterns — the LLM receives them and must comply.
+    // Only the "no suggest_edit" case above triggers a hard DENY.
+    // ── END GATEKEEPER ──
     try {
         // 1. Backup current version in .rl4/snapshots/
         let backupChecksum = "";
@@ -1719,17 +2380,73 @@ mcpServer.tool("apply_edit", "Write file content with SHA-256 backup and proof c
             }
             lastCRESelection = null; // always consume, even if stale
         }
-        // 5. CRE — Resolve pending outcomes for this file
+        // 5. Emit IntentEvent so IntentGraph tracks this write as a version
+        const newChecksum = crypto.createHash("sha256").update(newContent).digest("hex");
+        try {
+            const snapshotsDir = resolveUnderRoot(root, ".rl4", "snapshots");
+            const newBlobPath = path.join(snapshotsDir, `${newChecksum}.content`);
+            if (!fs.existsSync(newBlobPath)) {
+                fs.writeFileSync(newBlobPath, newContent);
+            }
+            const intentEvent = {
+                t: new Date().toISOString(),
+                file: relPath,
+                from_sha256: backupChecksum || null,
+                to_sha256: newChecksum,
+                delta: {
+                    linesAdded: newContent.split("\n").length,
+                    linesRemoved: 0,
+                    netChange: newContent.split("\n").length,
+                },
+                intent_signal: "apply_edit",
+                causing_prompt: null,
+                burst_id: null,
+                persisted_at: new Date().toISOString(),
+            };
+            const chainsPath = resolveUnderRoot(root, ".rl4", "evidence", "intent_chains.jsonl");
+            lockedAppend(chainsPath, JSON.stringify(intentEvent));
+            // Also emit to activity.jsonl — CRE outcome resolution reads from here
+            const activityEvent = {
+                t: intentEvent.t,
+                kind: "save",
+                path: relPath,
+                sha256: newChecksum,
+                linesAdded: intentEvent.delta.linesAdded,
+                linesRemoved: intentEvent.delta.linesRemoved,
+                source: "apply_edit",
+            };
+            const activityPath = resolveUnderRoot(root, ".rl4", "evidence", "activity.jsonl");
+            lockedAppend(activityPath, JSON.stringify(activityEvent));
+        }
+        catch { /* non-critical — don't fail the write */ }
+        // 6. CRE — Resolve pending outcomes for this file
         resolveOutcomes(root, [relPath]);
+        // Build response with CRE lessons inline
+        let responseText = JSON.stringify({
+            ok: true,
+            backup_checksum: backupChecksum || null,
+            file: relPath,
+            cre_intervention_id: interventionId,
+        });
+        if (cachedSuggestion && cachedSuggestion.lessons.length > 0) {
+            responseText += "\n\n⚠️ RL4 LESSONS (respect these):\n";
+            for (const l of cachedSuggestion.lessons) {
+                responseText += `- [${l.type}] ${l.text} (score: ${l.score.toFixed(2)})\n`;
+            }
+            const coupled = cachedSuggestion.lessons
+                .filter(l => l.type === "COUPLING")
+                .map(l => l.text);
+            if (coupled.length > 0) {
+                responseText += "\n📎 ALSO CHECK: " + coupled.join(", ");
+            }
+        }
+        else if (!cachedSuggestion && enforcement === "soft") {
+            responseText += "\n\n⚠️ WARNING: suggest_edit was not called before this write. CRE lessons were not evaluated.";
+        }
         return {
             content: [{
                     type: "text",
-                    text: JSON.stringify({
-                        ok: true,
-                        backup_checksum: backupChecksum || null,
-                        file: relPath,
-                        cre_intervention_id: interventionId,
-                    }),
+                    text: responseText,
                 }],
         };
     }
@@ -1925,8 +2642,16 @@ async function main() {
     await mcpServer.connect(transport);
     // Log to stderr so we don't break stdio
     console.error("[RL4 MCP] Server running. Workspace root:", root);
-    // Warm up RAG engine in background (non-blocking) so first query is instant
+    // Rebuild timeline.md + evidence.md at startup (includes session synthesis)
+    // Then warm up RAG engine so it indexes the freshly rebuilt files
     setImmediate(() => {
+        try {
+            const r = rebuildAll(root);
+            console.error(`[RL4 MCP] Startup rebuild: timeline=${r.timelineChars}c, evidence=${r.evidenceChars}c`);
+        }
+        catch (e) {
+            console.error("[RL4 MCP] Startup rebuild failed (non-fatal):", e === null || e === void 0 ? void 0 : e.message);
+        }
         try {
             const w = warmUpEngine(root);
             console.error(`[RL4 MCP] Engine warm-up: ${w.chunks} chunks indexed in ${w.timeMs}ms`);
@@ -1935,6 +2660,13 @@ async function main() {
             console.error("[RL4 MCP] Engine warm-up failed (non-fatal):", e === null || e === void 0 ? void 0 : e.message);
         }
     });
+    // Start HTTP gatekeeper server (same process, shared caches)
+    try {
+        startHttpServer(root, { port: parseInt(process.env.RL4_HTTP_PORT || "17340", 10) });
+    }
+    catch (e) {
+        console.error("[RL4 MCP] HTTP gatekeeper start failed (non-fatal):", e === null || e === void 0 ? void 0 : e.message);
+    }
 }
 main().catch((err) => {
     console.error("[RL4 MCP] Fatal:", err);

@@ -29,6 +29,6 @@ export declare function logIntervention(root: string, file: string, selection: S
  * Resolve pending interventions for a given file.
  * Called on file save, burst flush, and commit detection.
  */
-export declare function resolveOutcomes(root: string, files: string[]): void;
+export declare function resolveOutcomes(root: string, files?: string[]): void;
 export declare function recomputeStateFromLogs(root: string): CREState;
 export declare function readAllInterventions(root: string): CREIntervention[];

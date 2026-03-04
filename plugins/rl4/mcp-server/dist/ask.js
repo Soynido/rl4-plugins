@@ -7,6 +7,7 @@
  */
 import { analyzeQuery } from "./queryProcessor.js";
 import { runRAGWithAnalysis } from "./rag.js";
+import { buildMetadataIndex } from "./indexBuilder.js";
 /** Adaptive snippet size by relevance tier — high-relevance sources get more space */
 const SNIPPET_BY_RELEVANCE = {
     high: 1200,
@@ -43,6 +44,15 @@ export function ask(root, query, options = {}) {
     };
     // 3. Run enhanced RAG
     const ragResult = runRAGWithAnalysis(root, analysis, filters);
+    // 3b. Ensure live context chunks are always included (sessions + activity)
+    //     BM25 may miss them if query terms don't match. The LLM decides relevance.
+    const liveIds = new Set(ragResult.chunks.map(c => c.id));
+    const fullIndex = buildMetadataIndex(root);
+    for (const chunk of fullIndex.chunks) {
+        if (chunk.id.startsWith("live-") && !liveIds.has(chunk.id)) {
+            ragResult.chunks.push({ ...chunk, relevanceScore: 0.5 });
+        }
+    }
     // 4. Format answer with numbered citations (Perplexity-style)
     const { answer, sources } = formatAnswerWithCitations(ragResult.chunks, analysis, ragResult.confidence);
     // 5. Generate related questions

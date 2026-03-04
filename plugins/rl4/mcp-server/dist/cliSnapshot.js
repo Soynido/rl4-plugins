@@ -10,6 +10,8 @@ import { createHash } from "crypto";
 import { execFile } from "child_process";
 import { resolveUnderRoot } from "./safePath.js";
 import { readFileSafe } from "./workspace.js";
+import { lockedWrite, lockedAppendAsync, ensureDirSync } from "./utils/fs_lock.js";
+import { scanItemToChatMessage } from "./scanItemTransformer.js";
 // ─── Helpers ────────────────────────────────────────────────────────────────
 function execFilePromise(cmd, args) {
     return new Promise((resolve) => {
@@ -215,7 +217,7 @@ function findCursorWorkspaceId(workspaceRoot, userDirs) {
 // ─── Scanners ───────────────────────────────────────────────────────────────
 const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50MB guard
 /** Scan Cursor workspace DB + global DB for chat history */
-async function scanCursorDb(workspaceRoot) {
+export async function scanCursorDb(workspaceRoot, limit = 500) {
     const userDirs = getCursorUserDirCandidates();
     const { workspaceId, userDir } = findCursorWorkspaceId(workspaceRoot, userDirs);
     if (!workspaceId || !userDir) {
@@ -225,7 +227,7 @@ async function scanCursorDb(workspaceRoot) {
     // 1. Try global storage (full thread list — preferred)
     const globalDbPath = path.join(userDir, "globalStorage", "state.vscdb");
     if (fs.existsSync(globalDbPath)) {
-        const globalItems = await scanCursorGlobalDb(globalDbPath, workspaceRoot);
+        const globalItems = await scanCursorGlobalDb(globalDbPath, workspaceRoot, limit);
         items.push(...globalItems);
     }
     // 2. Try workspace storage (aiService.generations — fallback)
@@ -240,7 +242,7 @@ async function scanCursorDb(workspaceRoot) {
     return { source: "cursor", items, threads: groupThreads(items) };
 }
 /** Scan Cursor global DB (composerData + bubbles) */
-async function scanCursorGlobalDb(globalDbPath, workspaceRoot) {
+async function scanCursorGlobalDb(globalDbPath, workspaceRoot, limit = 500) {
     var _a;
     const root = path.resolve(workspaceRoot);
     const rootForward = root.replace(/\\/g, "/");
@@ -255,7 +257,7 @@ async function scanCursorGlobalDb(globalDbPath, workspaceRoot) {
     const sql = `SELECT key, CAST(value AS TEXT) AS value ` +
         `FROM cursorDiskKV ` +
         `WHERE key LIKE 'composerData:%' AND length(value) > ${MIN_SIZE} AND (${like}) ` +
-        `ORDER BY rowid DESC LIMIT 500;`;
+        `ORDER BY rowid DESC` + (limit > 0 ? ` LIMIT ${limit}` : ``) + `;`;
     const res = await sqliteQuery(globalDbPath, sql, "json");
     if (res.code !== 0 || !res.stdout.trim())
         return [];
@@ -723,17 +725,38 @@ export async function buildCliSnapshot(workspaceRoot) {
         last_modified_at: lastT,
         file_events_count: activityEvents.length,
     };
-    // Write/update chat_history.jsonl
+    // Write/update chat_history.jsonl — APPEND (not overwrite) with canonical format
     try {
-        if (!fs.existsSync(evidenceDir))
-            fs.mkdirSync(evidenceDir, { recursive: true });
+        ensureDirSync(evidenceDir);
         const chatHistPath = resolveUnderRoot(workspaceRoot, ".rl4", "evidence", "chat_history.jsonl");
-        const chatLines = merged.items.map((i) => JSON.stringify(i)).join("\n") + "\n";
-        fs.writeFileSync(chatHistPath, chatLines, "utf8");
-        // Write chat_threads.jsonl
+        // Dedup: read existing IDs to avoid duplicates
+        const existingIds = new Set();
+        try {
+            if (fs.existsSync(chatHistPath)) {
+                const lines = fs.readFileSync(chatHistPath, "utf8").split("\n").filter(Boolean);
+                for (const line of lines) {
+                    try {
+                        const obj = JSON.parse(line);
+                        if (obj.id)
+                            existingIds.add(obj.id);
+                    }
+                    catch { /* skip malformed */ }
+                }
+            }
+        }
+        catch { /* ignore read errors */ }
+        // Transform to canonical format and append only new messages
+        const newMessages = merged.items
+            .map((i) => scanItemToChatMessage(i))
+            .filter((m) => !existingIds.has(m.id));
+        if (newMessages.length > 0) {
+            const chatLines = newMessages.map((m) => JSON.stringify(m)).join("\n") + "\n";
+            await lockedAppendAsync(chatHistPath, chatLines);
+        }
+        // Write chat_threads.jsonl (overwrite OK — threads are derived, not append-only)
         const threadHistPath = resolveUnderRoot(workspaceRoot, ".rl4", "evidence", "chat_threads.jsonl");
         const threadLines = merged.threads.map((t) => JSON.stringify(t)).join("\n") + "\n";
-        fs.writeFileSync(threadHistPath, threadLines, "utf8");
+        lockedWrite(threadHistPath, threadLines);
     }
     catch {
         /* best effort */
