@@ -31,14 +31,21 @@ If this fails (401, no token, or error):
  │                                                                       │
  │  RL4 needs authentication for cloud features.                         │
  │                                                                       │
- │  1. Open:  https://rl4.ai/start                                      │
- │  2. Sign in with GitHub                                               │
- │  3. Copy credentials from the "Claude Code" tab                       │
+ │  Opening sign-in page...                                              │
  │                                                                       │
  │  Or: RL4 works locally without auth. Try reading .rl4/ directly.      │
  │                                                                       │
  └───────────────────────────────────────────────────────────────────────┘
 ```
+
+Then open the sign-in page using Bash:
+
+```bash
+open "https://rl4.ai/start" 2>/dev/null || xdg-open "https://rl4.ai/start" 2>/dev/null || echo "Visit: https://rl4.ai/start"
+```
+
+After the user signs in, credentials sync via `~/.rl4/mcp.env`. Run `/rl4:connect` to verify.
+
 Fallback: read `.rl4/evidence.md` and `.rl4/timeline.md` directly. If they exist, continue in local-only mode.
 
 ## Step 3: Load Context & Dashboard
@@ -83,6 +90,9 @@ Call `get_evidence` and `get_timeline` in parallel. Parse the results and render
  ║  │ /rl4:sync      │ Sync chat history from all editors           │   ║
  ║  │ /rl4:snapshot  │ Capture full project state                   │   ║
  ║  │ /rl4:onboard   │ Onboard a teammate with shared context      │   ║
+ ║  │ /rl4:status    │ MCP server health & diagnostics             │   ║
+ ║  │ /rl4:keys      │ Open API key management dashboard           │   ║
+ ║  │ /rl4:connect   │ Validate credentials & connection           │   ║
  ║  └────────────────┴──────────────────────────────────────────────┘   ║
  ╚══════════════════════════════════════════════════════════════════════╝
 ```
